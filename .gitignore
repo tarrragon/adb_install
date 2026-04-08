@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+pulled_apk/
+.claude/
+
+# ADB binaries (auto-downloaded at runtime)
+adb
+adb.exe
+AdbWinApi.dll
+AdbWinUsbApi.dll
+platform-tools.zip
