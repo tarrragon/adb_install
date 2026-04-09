@@ -170,11 +170,18 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="container">
         <h1>ADB 遙控器</h1>
 
-        <!-- Restart ADB -->
+        <!-- ADB Diagnostics -->
         <div class="card" style="background: #f9f9f9;">
-            <h2>重啟 ADB Server</h2>
-            <p class="desc">如果配對或連線失敗，可嘗試重啟 ADB Server 後再操作</p>
-            <button onclick="doRestart()" style="background: #ff9500;">重啟 ADB Server</button>
+            <h2>ADB Server 管理</h2>
+            <p class="desc">如果配對或連線失敗，可診斷狀態或強制重啟</p>
+            <div style="display:flex; gap:8px; margin-bottom:8px;">
+                <button onclick="doDiagnose()" style="flex:1; background:#007aff;">診斷狀態</button>
+                <button onclick="doRestart()" style="flex:1; background:#ff9500;">一般重啟</button>
+                <button onclick="doForceRestart()" style="flex:1; background:#ff3b30;">強制重啟</button>
+            </div>
+            <p style="font-size:11px; color:#86868b; margin-bottom:4px;">
+                強制重啟 = 殺掉所有 ADB 進程（含殭屍狀態），重建全新 Server
+            </p>
             <div class="result" id="restart-result"></div>
         </div>
 
@@ -209,9 +216,22 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="card">
             <span class="step-badge">步驟 2</span>
             <h2>連線裝置 (Connect)</h2>
-            <p class="desc">使用無線偵錯顯示的 IP 位址和連接埠</p>
-            <label>連線位址 (IP:Port)</label>
-            <input type="text" id="connect-addr" placeholder="例: 192.168.1.100:43567">
+            <p class="desc">已配對的裝置會自動偵測，也可手動輸入連線位址</p>
+
+            <button onclick="doConnectScan()" id="connect-scan-btn" style="background:#34c759; margin-bottom:12px;">掃描已配對裝置</button>
+            <div class="result" id="connect-scan-result"></div>
+
+            <div id="connect-device-section" style="display:none; margin-bottom:12px;">
+                <label>偵測到的已配對裝置</label>
+                <select id="connect-device-select" style="width:100%; padding:10px 12px; border:1px solid #d2d2d7; border-radius:8px; font-size:15px; margin-bottom:4px; outline:none;"></select>
+            </div>
+
+            <div id="manual-connect-section" style="display:none; margin-bottom:12px;">
+                <label>連線位址 (IP:Port)</label>
+                <input type="text" id="connect-addr" placeholder="例: 192.168.1.100:43567">
+            </div>
+            <a href="#" onclick="toggleManualConnect(); return false;" style="font-size:12px; color:#007aff; display:inline-block; margin-bottom:12px;" id="manual-connect-toggle">手動輸入連線位址</a>
+
             <button onclick="doConnect()">連線</button>
             <div class="result" id="connect-result"></div>
         </div>
@@ -304,6 +324,19 @@ HTML_PAGE = """<!DOCTYPE html>
             refreshDevices();
         }
 
+        async function doForceRestart() {
+            showResult('restart-result', '強制終止所有 ADB 進程中...', 'loading');
+            const res = await postJSON('/api/force-restart', {});
+            showResult('restart-result', res.output, res.success ? 'success' : 'error');
+            refreshDevices();
+        }
+
+        async function doDiagnose() {
+            showResult('restart-result', '診斷中...', 'loading');
+            const res = await postJSON('/api/adb-diagnose', {});
+            showResult('restart-result', res.output, res.success ? 'success' : 'error');
+        }
+
         let mdnsDevices = [];
 
         async function doMdnsScan() {
@@ -363,24 +396,92 @@ HTML_PAGE = """<!DOCTYPE html>
             if (res.success) autoScanAndConnect();
         }
 
-        async function autoScanAndConnect() {
-            showResult('connect-result', '配對成功！正在自動搜尋連線位址...', 'loading');
-            const res = await postJSON('/api/mdns-scan', {type: 'connect'});
+        let connectDevices = [];
+
+        async function doConnectScan() {
+            const btn = document.getElementById('connect-scan-btn');
+            btn.disabled = true;
+            btn.textContent = '偵測中...';
+            showResult('connect-scan-result', '正在偵測可連線的裝置（已連線 + mDNS 掃描）...', 'loading');
+            const res = await postJSON('/api/discover-connect', {});
+            btn.disabled = false;
+            btn.textContent = '掃描已配對裝置';
             if (res.success && res.devices && res.devices.length > 0) {
-                const addr = res.devices[0].addr;
-                document.getElementById('connect-addr').value = addr;
-                showResult('connect-result', '找到連線位址: ' + addr + '，正在自動連線...', 'loading');
-                const connRes = await postJSON('/api/connect', {addr});
-                showResult('connect-result', connRes.output, connRes.success ? 'success' : 'error');
-                if (connRes.success) refreshDevices();
+                connectDevices = res.devices;
+                const select = document.getElementById('connect-device-select');
+                select.textContent = '';
+                res.devices.forEach(function(d) {
+                    const opt = document.createElement('option');
+                    opt.value = d.addr;
+                    const label = d.status ? d.name + ' [' + d.status + ']' : d.name;
+                    opt.textContent = label;
+                    select.appendChild(opt);
+                });
+                document.getElementById('connect-device-section').style.display = 'block';
+                const summary = res.devices.map(function(d) { return d.addr + ' (' + d.status + ')'; }).join('\\n');
+                showResult('connect-scan-result', '找到 ' + res.devices.length + ' 台裝置：\\n' + summary, 'success');
             } else {
-                showResult('connect-result', '未自動找到連線位址，請手動輸入後按「連線」', 'error');
+                connectDevices = [];
+                document.getElementById('connect-device-section').style.display = 'none';
+                showResult('connect-scan-result', res.output || '未找到裝置（需先完成步驟 1 配對）', 'error');
+            }
+        }
+
+        function toggleManualConnect() {
+            const section = document.getElementById('manual-connect-section');
+            const toggle = document.getElementById('manual-connect-toggle');
+            if (section.style.display === 'none') {
+                section.style.display = 'block';
+                toggle.textContent = '使用自動掃描';
+            } else {
+                section.style.display = 'none';
+                toggle.textContent = '手動輸入連線位址';
+            }
+        }
+
+        async function autoScanAndConnect() {
+            showResult('connect-scan-result', '配對成功！正在自動搜尋連線位址...', 'loading');
+            const res = await postJSON('/api/discover-connect', {});
+            if (res.success && res.devices && res.devices.length > 0) {
+                // 找未連線的裝置優先連線
+                const unconnected = res.devices.filter(function(d) { return d.status !== '已連線'; });
+                const target = unconnected.length > 0 ? unconnected[0] : null;
+                // 更新下拉選單
+                connectDevices = res.devices;
+                const select = document.getElementById('connect-device-select');
+                select.textContent = '';
+                res.devices.forEach(function(d) {
+                    const opt = document.createElement('option');
+                    opt.value = d.addr;
+                    opt.textContent = d.name + ' [' + d.status + ']';
+                    select.appendChild(opt);
+                });
+                document.getElementById('connect-device-section').style.display = 'block';
+                if (target) {
+                    showResult('connect-scan-result', '找到連線位址: ' + target.addr, 'success');
+                    showResult('connect-result', '正在自動連線 ' + target.addr + '...', 'loading');
+                    const connRes = await postJSON('/api/connect', {addr: target.addr});
+                    showResult('connect-result', connRes.output, connRes.success ? 'success' : 'error');
+                    if (connRes.success) refreshDevices();
+                } else {
+                    showResult('connect-scan-result', '所有裝置皆已連線', 'success');
+                    refreshDevices();
+                }
+            } else {
+                showResult('connect-scan-result', '未自動找到連線位址，請手動輸入', 'error');
             }
         }
 
         async function doConnect() {
-            const addr = document.getElementById('connect-addr').value.trim();
-            if (!addr) { showResult('connect-result', '請填寫連線位址', 'error'); return; }
+            // 優先使用手動輸入，否則用掃描結果
+            let addr = '';
+            const manualAddr = document.getElementById('connect-addr');
+            if (manualAddr) addr = manualAddr.value.trim();
+            if (!addr) {
+                const select = document.getElementById('connect-device-select');
+                if (select && select.value) addr = select.value;
+            }
+            if (!addr) { showResult('connect-result', '請先掃描已配對裝置或手動輸入連線位址', 'error'); return; }
             showResult('connect-result', '連線中...', 'loading');
             const res = await postJSON('/api/connect', {addr});
             showResult('connect-result', res.output, res.success ? 'success' : 'error');
@@ -523,9 +624,10 @@ HTML_PAGE = """<!DOCTYPE html>
             showResult('scan-result', res.output, res.success ? 'success' : 'error');
         }
 
-        // 頁面載入時自動偵測裝置並掃描區網
+        // 頁面載入時自動偵測裝置並掃描區網（配對 + 連線）
         refreshDevices();
         doMdnsScan();
+        doConnectScan();
     </script>
 </body>
 </html>
@@ -552,20 +654,113 @@ class ADBHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _run_adb(self, args, input_text=None):
+    def _run_adb(self, args, input_text=None, timeout=120):
         try:
             result = subprocess.run(
                 [ADB_PATH] + args,
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, timeout=timeout,
                 input=input_text,
             )
             output = (result.stdout + result.stderr).strip()
             success = result.returncode == 0
             return {"success": success, "output": output if output else ("OK" if success else "未知錯誤")}
         except subprocess.TimeoutExpired:
-            return {"success": False, "output": "操作逾時（超過 120 秒）"}
+            return {"success": False, "output": "操作逾時", "timeout": True}
         except Exception as e:
             return {"success": False, "output": f"執行錯誤: {e}"}
+
+    def _get_adb_version(self):
+        """取得 ADB 版本資訊"""
+        try:
+            r = subprocess.run(
+                [ADB_PATH, "version"], capture_output=True, text=True, timeout=5
+            )
+            return r.stdout.strip()
+        except Exception:
+            return "無法取得版本"
+
+    def _check_port_5037(self):
+        """檢查 port 5037 是否被佔用，回傳佔用的 PID 列表"""
+        pids = []
+        try:
+            if _system == "Windows":
+                r = subprocess.run(
+                    ["netstat", "-ano"], capture_output=True, text=True, timeout=5
+                )
+                for line in r.stdout.splitlines():
+                    if ":5037" in line and "LISTEN" in line:
+                        parts = line.split()
+                        if parts:
+                            pids.append(parts[-1])
+            else:
+                r = subprocess.run(
+                    ["lsof", "-i", ":5037", "-t"],
+                    capture_output=True, text=True, timeout=5
+                )
+                pids = [p.strip() for p in r.stdout.splitlines() if p.strip()]
+        except Exception:
+            pass
+        return pids
+
+    def _kill_zombie_adb(self):
+        """強制終止所有 ADB 進程和佔用 5037 port 的進程"""
+        killed = []
+        # 1. 先嘗試正常 kill-server（給 3 秒）
+        try:
+            subprocess.run(
+                [ADB_PATH, "kill-server"],
+                capture_output=True, timeout=3
+            )
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+
+        # 2. 強殺所有 adb 進程
+        if _system == "Windows":
+            try:
+                r = subprocess.run(
+                    ["taskkill", "/F", "/IM", "adb.exe"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r.returncode == 0:
+                    killed.append("taskkill adb.exe")
+            except Exception:
+                pass
+        else:
+            # kill by name
+            try:
+                r = subprocess.run(
+                    ["killall", "-9", "adb"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r.returncode == 0:
+                    killed.append("killall -9 adb")
+            except Exception:
+                pass
+
+            # 3. 確認 5037 port 是否還被佔用，強殺殘留
+            pids = self._check_port_5037()
+            for pid in pids:
+                try:
+                    subprocess.run(
+                        ["kill", "-9", pid],
+                        capture_output=True, timeout=3
+                    )
+                    killed.append(f"kill -9 {pid}")
+                except Exception:
+                    pass
+
+        return killed
+
+    def _adb_server_responsive(self):
+        """測試 ADB server 是否有回應（用 adb devices，給 5 秒）"""
+        try:
+            r = subprocess.run(
+                [ADB_PATH, "devices"],
+                capture_output=True, text=True, timeout=5
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -675,6 +870,73 @@ class ADBHandler(BaseHTTPRequestHandler):
                     })
         return devices
 
+    def _adb_mdns_services(self, filter_type=None):
+        """使用 adb mdns services 查詢 ADB 內建的 mDNS 追蹤結果"""
+        try:
+            r = subprocess.run(
+                [ADB_PATH, "mdns", "services"],
+                capture_output=True, text=True, timeout=5
+            )
+            devices = []
+            for line in r.stdout.splitlines():
+                if not line.startswith("\t") and not line.startswith(" "):
+                    continue
+                parts = line.split()
+                # 格式: name  service_type  addr:port
+                if len(parts) >= 3:
+                    name = parts[0]
+                    svc_type = parts[1]
+                    addr = parts[2]
+                    if filter_type and filter_type not in svc_type:
+                        continue
+                    devices.append({
+                        "name": name,
+                        "addr": addr,
+                        "hostname": "",
+                        "source": "adb-mdns",
+                    })
+            return devices
+        except Exception:
+            return []
+
+    def _discover_connectable(self):
+        """綜合偵測所有可連線的裝置（已連線 + mDNS 待連線 + ADB mdns 追蹤）"""
+        found = []
+        seen_addrs = set()
+
+        # 1. adb devices — 已連線的裝置
+        connected = self._get_devices()
+        for dev in connected:
+            if ":" in dev:  # 無線裝置格式為 ip:port
+                found.append({
+                    "name": dev,
+                    "addr": dev,
+                    "status": "已連線",
+                })
+                seen_addrs.add(dev)
+
+        # 2. adb mdns services — ADB 自己追蹤到的
+        for dev in self._adb_mdns_services("_adb-tls-connect"):
+            if dev["addr"] not in seen_addrs:
+                found.append({
+                    "name": dev["name"],
+                    "addr": dev["addr"],
+                    "status": "待連線 (ADB mdns)",
+                })
+                seen_addrs.add(dev["addr"])
+
+        # 3. dns-sd / avahi — 系統層 mDNS 掃描
+        for dev in self._mdns_scan("_adb-tls-connect._tcp"):
+            if dev["addr"] not in seen_addrs:
+                found.append({
+                    "name": dev["name"],
+                    "addr": dev["addr"],
+                    "status": "待連線 (mDNS)",
+                })
+                seen_addrs.add(dev["addr"])
+
+        return found
+
     def do_GET(self):
         self._send_html()
 
@@ -685,11 +947,93 @@ class ADBHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, "devices": devices})
 
         elif self.path == "/api/restart":
-            self._run_adb(["kill-server"])
-            result = self._run_adb(["start-server"])
-            if result["success"]:
+            self._read_body()
+            self._run_adb(["kill-server"], timeout=5)
+            result = self._run_adb(["start-server"], timeout=10)
+            if result.get("timeout"):
+                result["output"] = (
+                    "ADB Server 重啟逾時，可能處於殭屍狀態。\n"
+                    "建議使用「強制重啟」按鈕。"
+                )
+            elif result["success"]:
                 result["output"] = "ADB Server 已重啟"
             self._send_json(result)
+
+        elif self.path == "/api/force-restart":
+            self._read_body()
+            # Step 1: 強殺所有 ADB 進程
+            killed = self._kill_zombie_adb()
+            import time
+            time.sleep(1)
+
+            # Step 2: 確認 port 已釋放
+            remaining = self._check_port_5037()
+            if remaining:
+                self._send_json({
+                    "success": False,
+                    "output": (
+                        f"已嘗試強殺: {', '.join(killed) if killed else '無'}\n"
+                        f"但 port 5037 仍被佔用 (PID: {', '.join(remaining)})\n"
+                        "請手動執行: kill -9 " + " ".join(remaining)
+                    ),
+                })
+                return
+
+            # Step 3: 啟動新的 ADB server
+            result = self._run_adb(["start-server"], timeout=10)
+            lines = []
+            if killed:
+                lines.append(f"已強殺進程: {', '.join(killed)}")
+            if result["success"]:
+                lines.append("ADB Server 已重新啟動")
+            else:
+                lines.append(f"啟動失敗: {result['output']}")
+            self._send_json({
+                "success": result["success"],
+                "output": "\n".join(lines),
+            })
+
+        elif self.path == "/api/adb-diagnose":
+            self._read_body()
+            info = []
+            # ADB 版本
+            info.append(f"[ADB 版本]\n{self._get_adb_version()}")
+            # Port 5037 狀態
+            pids = self._check_port_5037()
+            if pids:
+                info.append(f"[Port 5037] 被佔用 (PID: {', '.join(pids)})")
+            else:
+                info.append("[Port 5037] 未被佔用（ADB Server 未運行）")
+            # ADB Server 回應測試
+            responsive = self._adb_server_responsive()
+            info.append(f"[ADB Server 回應] {'正常' if responsive else '無回應或逾時（可能為殭屍狀態）'}")
+            # 已連線裝置
+            if responsive:
+                devices = self._get_devices()
+                if devices:
+                    info.append(f"[已連線裝置] {', '.join(devices)}")
+                else:
+                    info.append("[已連線裝置] 無")
+            self._send_json({"success": True, "output": "\n\n".join(info)})
+
+        elif self.path == "/api/discover-connect":
+            self._read_body()
+            try:
+                devices = self._discover_connectable()
+                if devices:
+                    self._send_json({
+                        "success": True,
+                        "devices": devices,
+                        "output": f"找到 {len(devices)} 台裝置",
+                    })
+                else:
+                    self._send_json({
+                        "success": False,
+                        "devices": [],
+                        "output": "未找到可連線裝置",
+                    })
+            except Exception as e:
+                self._send_json({"success": False, "devices": [], "output": f"偵測失敗: {e}"})
 
         elif self.path == "/api/mdns-scan":
             data = json.loads(self._read_body())
@@ -729,6 +1073,23 @@ class ADBHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "output": "配對碼應為純數字"})
                 return
             result = self._run_adb(["pair", addr, code])
+            if result.get("timeout"):
+                # 檢查是否為殭屍 ADB server
+                responsive = self._adb_server_responsive()
+                if not responsive:
+                    result["output"] = (
+                        "配對逾時：ADB Server 無回應（疑似殭屍狀態）。\n"
+                        "請按上方「強制重啟 ADB Server」後重試。\n"
+                        "（Android 端配對碼可能已過期，需重新開啟配對畫面）"
+                    )
+                else:
+                    result["output"] = (
+                        "配對逾時：ADB Server 正常但裝置無回應。\n"
+                        "請確認：\n"
+                        "1. Android 端「使用配對碼配對裝置」畫面仍開啟\n"
+                        "2. 配對碼未過期（超時會自動關閉）\n"
+                        "3. IP 和 Port 正確（Port 每次開啟配對畫面都會變）"
+                    )
             self._send_json(result)
 
         elif self.path == "/api/connect":
@@ -741,10 +1102,20 @@ class ADBHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "output": "位址格式不正確，應為 IP:Port (例: 192.168.1.100:43567)"})
                 return
             result = self._run_adb(["connect", addr])
-            # adb connect 失敗時 exit code 仍為 0，需檢查輸出文字
-            output_lower = result["output"].lower()
-            if "failed" in output_lower or "cannot" in output_lower or "error" in output_lower:
-                result["success"] = False
+            if result.get("timeout"):
+                responsive = self._adb_server_responsive()
+                if not responsive:
+                    result["output"] = (
+                        "連線逾時：ADB Server 無回應（疑似殭屍狀態）。\n"
+                        "請按上方「強制重啟 ADB Server」後重試。"
+                    )
+                else:
+                    result["output"] = "連線逾時：裝置無回應，請確認 IP 和 Port 正確。"
+            else:
+                # adb connect 失敗時 exit code 仍為 0，需檢查輸出文字
+                output_lower = result["output"].lower()
+                if "failed" in output_lower or "cannot" in output_lower or "error" in output_lower:
+                    result["success"] = False
             self._send_json(result)
 
         elif self.path == "/api/list-remote-apk":
@@ -935,13 +1306,23 @@ class ADBHandler(BaseHTTPRequestHandler):
 def main():
     ensure_adb()
 
-    # 重啟 adb server，避免殘留狀態導致配對失敗（加 timeout 避免卡住）
+    # 重啟 adb server，避免殘留狀態導致配對失敗
     try:
         subprocess.run([ADB_PATH, "kill-server"], capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        print("ADB kill-server 逾時，嘗試強制終止...")
+        if _system == "Windows":
+            subprocess.run(["taskkill", "/F", "/IM", "adb.exe"],
+                           capture_output=True, timeout=5)
+        else:
+            subprocess.run(["killall", "-9", "adb"], capture_output=True, timeout=5)
+        import time
+        time.sleep(1)
+    try:
         subprocess.run([ADB_PATH, "start-server"], capture_output=True, timeout=10)
         print("ADB server 已重啟")
     except subprocess.TimeoutExpired:
-        print("ADB server 重啟逾時，跳過（可在網頁上手動重啟）")
+        print("ADB server 啟動逾時，跳過（可在網頁上手動重啟）")
 
     server = HTTPServer(("127.0.0.1", PORT), ADBHandler)
     print(f"ADB 遙控器已啟動！")
