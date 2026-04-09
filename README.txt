@@ -17,66 +17,61 @@
 Windows: Double-click "啟動ADB工具.bat" (Python will be installed automatically on first run)
 
 Mac (first time):
-  1. Open Terminal (Launchpad > search "Terminal")
-  2. Type "bash " (with a space after bash), then drag "install.sh" from the
-     tool folder into the Terminal window, and press Enter
-  3. The script will automatically fix all permissions and launch the tool
-  4. From now on, just double-click "啟動ADB工具.command" to launch
+  Option A - Right-click to open (easiest):
+    1. Right-click (or Control+Click) on "啟動ADB工具.command"
+    2. Select "Open" from the menu
+    3. Click "Open" in the confirmation dialog
+    4. From now on, just double-click to launch
 
+  Option B - Run install script:
+    1. Open Terminal (Launchpad > search "Terminal")
+    2. Type "bash " (with a space after bash), then drag "install.sh" from the
+       tool folder into the Terminal window, and press Enter
+    3. The script will automatically fix all permissions and launch the tool
+    4. From now on, just double-click "啟動ADB工具.command" to launch
+
+Note: ADB will be automatically downloaded from Google on first launch.
 The browser will open the control page automatically after launch.
 
 
 [macOS Troubleshooting - Permission Issues]
 
-If the install.sh script above already worked, you can skip this section.
+If the steps above already worked, you can skip this section.
 The steps below are for manual troubleshooting if something still goes wrong.
 
 Issue 1 - macOS blocks the .command file on first launch
   When you double-click the .command file, macOS may show a warning like:
     "啟動ADB工具.command cannot be opened because it is from an unidentified developer."
   To fix:
-    System Settings > Privacy & Security > scroll down to the Security section
-    You will see a message about the blocked file -> Click "Open Anyway"
-    Then double-click the .command file again.
+    Right-click the file > select "Open" > click "Open" in the dialog.
+    Or: System Settings > Privacy & Security > scroll down > Click "Open Anyway"
 
 Issue 2 - "Operation not permitted" errors
-  If you see errors like:
-    - "can't open file 'app.py': [Errno 1] Operation not permitted"
-    - "Permission denied"
-
   This is caused by macOS security restrictions on downloaded files.
-  Follow BOTH steps below to fix it:
+  Open Terminal and run:
+    xattr -cr ~/Downloads/adb_install/
+    chmod +x ~/Downloads/adb_install/啟動ADB工具.command
 
-    Step A - Remove quarantine flag (required)
-      Open Terminal and run:
-        xattr -cr ~/Downloads/adb_install/
-
-    Step B - Grant execute permission (required)
-      In the same Terminal, run:
-        chmod +x ~/Downloads/adb_install/啟動ADB工具.command
-        chmod +x ~/Downloads/adb_install/adb
-
-  If "xattr" or "ls" also shows "Operation not permitted":
-    You need to grant Full Disk Access to Terminal first:
-      System Settings > Privacy & Security > Full Disk Access > Enable "Terminal"
-    Then reopen Terminal and run Step A and Step B again.
-
-  After completing all steps, double-click "啟動ADB工具.command" to launch.
+  If "xattr" also shows "Operation not permitted":
+    System Settings > Privacy & Security > Full Disk Access > Enable "Terminal"
+    Then reopen Terminal and run the commands again.
 
 
 [How to Use]
 
 Step 1 - Pair (required for first-time use)
-  - On the device, go to "Wireless Debugging" and tap "Pair device with pairing code"
-  - Enter the "IP address & Port" into the "Pair Address" field
-  - Enter the "Pairing Code" into the corresponding field
-  - Click "Pair"
+  - The tool automatically scans for nearby devices via mDNS on launch
+  - If a device is found, select it from the dropdown
+  - On the device, tap "Pair device with pairing code" to get the pairing code
+  - Enter the pairing code and click "Pair"
+  - If auto-scan doesn't find the device, click "手動輸入配對位址" to enter manually
   * The pairing code expires quickly, so enter it as soon as possible
 
 Step 2 - Connect
-  - On the device's "Wireless Debugging" page, find the "IP address & Port" at the top
-  - Enter it into the "Connect Address" field (note: this is different from Step 1)
-  - Click "Connect"
+  - After pairing, the tool will auto-scan and connect
+  - If auto-connect fails, click "掃描已配對裝置" to find paired devices
+  - Already-connected devices (e.g. paired via terminal) will also be detected
+  - You can also click "手動輸入連線位址" to enter the address manually
 
 Step 3 - Scan & Install APK
   - Choose scan source: "Device Path" or "Local Path"
@@ -94,9 +89,12 @@ Step 4 - Install APK from local file (alternative)
   - Click "Install"
 
 
-[Common Issues]
+[Troubleshooting - Connection Issues]
 
-- Pair or connect failed -> Click "Restart ADB Server" at the top, then try again
+- Click "診斷狀態" to check ADB version, server status, and connected devices
+- Click "一般重啟" to restart ADB server normally
+- Click "強制重啟" if ADB server is unresponsive (zombie state)
+  This force-kills all ADB processes and starts a fresh server
 - After device reboot, you need to pair and connect again
 - Make sure the device and computer are on the same Wi-Fi network
 
