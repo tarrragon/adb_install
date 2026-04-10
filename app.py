@@ -379,9 +379,12 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         async function doPair() {
-            let addr = document.getElementById('pair-addr').value.trim();
+            let addr = '';
             const code = document.getElementById('pair-code').value.trim();
-            // 優先使用手動輸入的位址，否則使用 mDNS 掃描結果
+            // 手動區塊展開時才讀取手動輸入，摺疊時用掃描結果
+            if (document.getElementById('manual-pair-section').style.display !== 'none') {
+                addr = document.getElementById('pair-addr').value.trim();
+            }
             if (!addr) {
                 const select = document.getElementById('mdns-device-select');
                 if (select && select.value) addr = select.value;
@@ -473,10 +476,12 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         async function doConnect() {
-            // 優先使用手動輸入，否則用掃描結果
+            // 手動區塊展開時才讀取手動輸入，摺疊時用掃描結果
             let addr = '';
-            const manualAddr = document.getElementById('connect-addr');
-            if (manualAddr) addr = manualAddr.value.trim();
+            if (document.getElementById('manual-connect-section').style.display !== 'none') {
+                const manualAddr = document.getElementById('connect-addr');
+                if (manualAddr) addr = manualAddr.value.trim();
+            }
             if (!addr) {
                 const select = document.getElementById('connect-device-select');
                 if (select && select.value) addr = select.value;
