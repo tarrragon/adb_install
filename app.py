@@ -9,6 +9,7 @@ import tempfile
 import platform
 import socket
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from urllib.request import urlretrieve
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -16,6 +17,7 @@ _dir = os.path.dirname(os.path.abspath(__file__))
 _system = platform.system()
 ADB_NAME = "adb.exe" if _system == "Windows" else "adb"
 ADB_PATH = os.path.join(_dir, ADB_NAME)
+KNOWN_PATH = os.path.join(_dir, "known_devices.json")
 PORT = 8080
 
 _PLATFORM_TOOLS_URLS = {
@@ -51,6 +53,56 @@ def ensure_adb():
     if _system != "Windows":
         os.chmod(ADB_PATH, 0o755)
     print(f"ADB 已下載至 {ADB_PATH}")
+
+def tcp_probe(ip, port, timeout=1.0):
+    """確認 ip:port 有人在聽。用於在 adb connect 前快速判斷位址是否還有效
+    （adb connect 對死掉的位址要卡約 2 分鐘才逾時）。"""
+    try:
+        with socket.create_connection((ip, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def load_known():
+    """讀取曾經連線成功的無線裝置（以硬體序號為 key）"""
+    try:
+        with open(KNOWN_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def reconnect_known():
+    """啟動時把曾連線過、目前仍可達的無線裝置接回來
+
+    本程式啟動時會 kill-server 以避免殭屍狀態，副作用是所有無線連線都被踢掉。
+    而裝置一旦被連上就停止廣播 _adb-tls-connect._tcp，掉線後在恢復廣播前
+    mDNS 找不到它 —— 所以只能靠記住的 IP:port 把它們接回來。
+    """
+    known = load_known()
+    targets = [
+        rec["addr"] for rec in known.values()
+        if rec.get("addr") and re.match(r"^[\w.\-]+:\d{1,5}$", rec["addr"])
+    ]
+    if not targets:
+        return
+    # 先並行探測，跳過死掉的位址，避免逐個卡 2 分鐘
+    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+        alive = list(pool.map(lambda a: tcp_probe(*a.rsplit(":", 1)), targets))
+    reachable = [a for a, ok in zip(targets, alive) if ok]
+    if not reachable:
+        print(f"曾連線的 {len(targets)} 台裝置目前皆無回應，請確認無線偵錯是否開啟")
+        return
+    for addr in reachable:
+        try:
+            r = subprocess.run([ADB_PATH, "connect", addr],
+                               capture_output=True, text=True, timeout=30)
+            print(f"  自動重連 {addr}: {r.stdout.strip() or r.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            print(f"  自動重連 {addr}: 逾時")
+
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-TW">
@@ -236,6 +288,19 @@ HTML_PAGE = """<!DOCTYPE html>
             <div class="result" id="connect-result"></div>
         </div>
 
+        <!-- 目標裝置：步驟 3 與步驟 4 共用 -->
+        <div class="card">
+            <h2>目標裝置</h2>
+            <p class="desc">勾選要安裝 APK 的裝置，可多選（步驟 3 與步驟 4 共用此選擇）</p>
+            <div id="target-list" style="margin-bottom:8px;"></div>
+            <div style="display:flex; gap:8px; margin-bottom:8px;">
+                <button onclick="selectAllTargets(true)" style="flex:1; background:#d2d2d7; color:#1d1d1f;">全選</button>
+                <button onclick="selectAllTargets(false)" style="flex:1; background:#d2d2d7; color:#1d1d1f;">全不選</button>
+                <button onclick="refreshDevices()" style="flex:1; background:#34c759;">重新整理</button>
+            </div>
+            <div id="device-status" style="font-size:13px; color:#86868b;"></div>
+        </div>
+
         <!-- Step 3: Scan & Install APK -->
         <div class="card">
             <span class="step-badge">步驟 3</span>
@@ -286,12 +351,6 @@ HTML_PAGE = """<!DOCTYPE html>
             <span class="step-badge">步驟 4</span>
             <h2>從本機安裝 APK</h2>
             <p class="desc">選擇本機的 APK 檔案上傳安裝</p>
-            <div id="device-section" style="display:none; margin-bottom: 12px;">
-                <label>選擇裝置</label>
-                <select id="device-select" style="width:100%; padding:10px 12px; border:1px solid #d2d2d7; border-radius:8px; font-size:15px; margin-bottom:4px; outline:none;"></select>
-                <button onclick="refreshDevices()" style="background:#34c759; margin-top:4px; margin-bottom:8px;">重新整理裝置列表</button>
-            </div>
-            <div id="device-status" style="font-size:13px; color:#86868b; margin-bottom:12px;"></div>
             <div class="upload-area" id="upload-area" onclick="document.getElementById('apk-file').click()">
                 <input type="file" id="apk-file" accept=".apk" onchange="onFileSelected(this)">
                 <p class="upload-text" id="upload-text">點擊選擇 APK 檔案</p>
@@ -512,30 +571,53 @@ HTML_PAGE = """<!DOCTYPE html>
 
         async function refreshDevices() {
             const res = await postJSON('/api/devices', {});
+            const previous = getSelectedDevices();
             devices = res.devices || [];
-            const section = document.getElementById('device-section');
+            const list = document.getElementById('target-list');
             const status = document.getElementById('device-status');
-            const select = document.getElementById('device-select');
+            list.textContent = '';
+
             if (devices.length === 0) {
-                section.style.display = 'none';
                 status.textContent = '尚未連線任何裝置，請先完成步驟 1 和 2';
                 status.style.color = '#c62828';
-            } else if (devices.length === 1) {
-                section.style.display = 'none';
-                status.textContent = '已連線裝置: ' + devices[0];
-                status.style.color = '#2e7d32';
-            } else {
-                section.style.display = 'block';
-                select.textContent = '';
-                devices.forEach(function(d) {
-                    const opt = document.createElement('option');
-                    opt.value = d;
-                    opt.textContent = d;
-                    select.appendChild(opt);
-                });
-                status.textContent = '偵測到 ' + devices.length + ' 台裝置，請選擇目標裝置';
-                status.style.color = '#1565c0';
+                return;
             }
+
+            devices.forEach(function(d) {
+                const row = document.createElement('label');
+                row.style.cssText = 'display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid #d2d2d7; border-radius:8px; margin-bottom:6px; font-size:14px; cursor:pointer;';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.className = 'target-cb';
+                cb.value = d;
+                // 只有一台時預設勾選；多台時保留使用者原本的勾選，不擅自代選
+                cb.checked = devices.length === 1 || previous.indexOf(d) !== -1;
+                cb.style.cssText = 'width:auto; margin:0;';
+                row.appendChild(cb);
+                const span = document.createElement('span');
+                span.textContent = d;
+                row.appendChild(span);
+                list.appendChild(row);
+            });
+
+            const picked = getSelectedDevices().length;
+            status.textContent = '已連線 ' + devices.length + ' 台，已勾選 ' + picked + ' 台';
+            status.style.color = picked > 0 ? '#2e7d32' : '#1565c0';
+        }
+
+        function getSelectedDevices() {
+            return Array.prototype.map.call(
+                document.querySelectorAll('.target-cb:checked'),
+                function(cb) { return cb.value; }
+            );
+        }
+
+        function selectAllTargets(checked) {
+            document.querySelectorAll('.target-cb').forEach(function(cb) { cb.checked = checked; });
+            const picked = getSelectedDevices().length;
+            const status = document.getElementById('device-status');
+            status.textContent = '已連線 ' + devices.length + ' 台，已勾選 ' + picked + ' 台';
+            status.style.color = picked > 0 ? '#2e7d32' : '#1565c0';
         }
 
         async function doInstall() {
@@ -544,9 +626,7 @@ HTML_PAGE = """<!DOCTYPE html>
             showResult('install-result', '上傳並安裝中，請稍候...', 'loading');
             const formData = new FormData();
             formData.append('apk', fileInput.files[0]);
-            if (devices.length > 1) {
-                formData.append('device', document.getElementById('device-select').value);
-            }
+            formData.append('devices', getSelectedDevices().join(','));
             const resp = await fetch('/api/install', { method: 'POST', body: formData });
             const res = await resp.json();
             showResult('install-result', res.output, res.success ? 'success' : 'error');
@@ -582,7 +662,7 @@ HTML_PAGE = """<!DOCTYPE html>
             if (!scanPath) { showResult('scan-result', '請填寫路徑', 'error'); return; }
             showResult('scan-result', '掃描中...', 'loading');
             const api = scanSource === 'device' ? '/api/list-remote-apk' : '/api/list-local-apk';
-            const res = await postJSON(api, {path: scanPath});
+            const res = await postJSON(api, {path: scanPath, devices: getSelectedDevices()});
             if (res.success && res.files && res.files.length > 0) {
                 const select = document.getElementById('scan-apk-select');
                 select.textContent = '';
@@ -607,7 +687,7 @@ HTML_PAGE = """<!DOCTYPE html>
             if (!apk) { showResult('scan-result', '請先掃描並選擇 APK', 'error'); return; }
             const scanPath = document.getElementById('scan-path').value.trim();
             showResult('scan-result', '拉取 APK 中...', 'loading');
-            const res = await postJSON('/api/pull-and-install', {filename: apk, path: scanPath});
+            const res = await postJSON('/api/pull-and-install', {filename: apk, path: scanPath, devices: getSelectedDevices()});
             showResult('scan-result', res.output, res.success ? 'success' : 'error');
         }
 
@@ -616,7 +696,7 @@ HTML_PAGE = """<!DOCTYPE html>
             if (!apk) { showResult('scan-result', '請先掃描並選擇 APK', 'error'); return; }
             const scanPath = document.getElementById('scan-path').value.trim();
             showResult('scan-result', '裝置安裝中，請稍候...', 'loading');
-            const res = await postJSON('/api/device-install', {filename: apk, path: scanPath});
+            const res = await postJSON('/api/device-install', {filename: apk, path: scanPath, devices: getSelectedDevices()});
             showResult('scan-result', res.output, res.success ? 'success' : 'error');
         }
 
@@ -625,7 +705,7 @@ HTML_PAGE = """<!DOCTYPE html>
             if (!apk) { showResult('scan-result', '請先掃描並選擇 APK', 'error'); return; }
             const scanPath = document.getElementById('scan-path').value.trim();
             showResult('scan-result', '安裝中，請稍候...', 'loading');
-            const res = await postJSON('/api/local-install', {filename: apk, path: scanPath});
+            const res = await postJSON('/api/local-install', {filename: apk, path: scanPath, devices: getSelectedDevices()});
             showResult('scan-result', res.output, res.success ? 'success' : 'error');
         }
 
@@ -771,8 +851,16 @@ class ADBHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length)
 
-    def _get_devices(self):
-        """取得已連線的裝置列表"""
+    def _get_devices(self, unique=True):
+        """取得已連線的裝置列表
+
+        unique=True 時會用硬體序號 (ro.serialno) 把同一台實體裝置的多個
+        transport 收斂成一個。這是必要的：adb 的 ADB_MDNS_AUTO_CONNECT 會用
+        mDNS 服務名自動連線，跟我們用 IP:port 連線會重複連上同一台
+        （實測同一台 I24D03 同時以 192.168.121.59:36707 和
+        adb-NDS228XGA508F0716-4rbguv._adb-tls-connect._tcp 出現）。
+        不收斂的話批次安裝會把同一份 APK 裝到同一台機器兩次。
+        """
         try:
             result = subprocess.run(
                 [ADB_PATH, "devices"], capture_output=True, text=True, timeout=10
@@ -784,11 +872,200 @@ class ADBHandler(BaseHTTPRequestHandler):
             parts = line.split()
             if len(parts) >= 2 and parts[1] == "device":
                 devices.append(parts[0])
-        return devices
+        if not unique or len(devices) < 2:
+            return devices
+
+        info = self._device_info(devices)
+        chosen = {}
+        # 同一序號有多個 transport 時，依偏好順序挑一個代表
+        for t in sorted(devices, key=self._transport_rank):
+            key = info.get(t, {}).get("serial") or t
+            chosen.setdefault(key, t)
+        keep = set(chosen.values())
+        return [t for t in devices if t in keep]
+
+    def _transport_rank(self, transport):
+        """同一台裝置有多個 transport 時的偏好順序
+
+        IP:port 最優先 —— 它是掉線後可以直接重連的形式；
+        mDNS 服務名最後 —— 裝置一連上就停止廣播，這個名字隨即失效。
+        """
+        if re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d+$", transport):
+            return 0
+        if "._tcp" in transport:
+            return 2
+        return 1
+
+    def _device_info(self, transports):
+        """並行查詢每個 transport 的硬體序號與機型
+
+        回傳 {transport: {"serial": ..., "model": ...}}
+        序號是辨識「是否為同一台實體裝置」的唯一可靠依據 ——
+        現場多台同型 POS 機的 model 全部相同，無法用來區分。
+        """
+        if not transports:
+            return {}
+
+        def query(t):
+            try:
+                r = subprocess.run(
+                    [ADB_PATH, "-s", t, "shell",
+                     "getprop ro.serialno; getprop ro.product.model"],
+                    capture_output=True, text=True, timeout=8
+                )
+                lines = [x.strip() for x in r.stdout.replace("\r", "").splitlines() if x.strip()]
+            except Exception:
+                lines = []
+            return t, {
+                "serial": lines[0] if len(lines) > 0 else "",
+                "model": lines[1] if len(lines) > 1 else "",
+            }
+
+        with ThreadPoolExecutor(max_workers=min(8, len(transports))) as pool:
+            return dict(pool.map(query, transports))
+
+    def _serial_from_mdns_name(self, name):
+        """從 mDNS 服務名取出硬體序號
+
+        Android 的服務名格式為 adb-<序號>-<隨機碼>，
+        例如 adb-NDS228XGA508F0977-1NSeCk -> NDS228XGA508F0977。
+        用來判斷 mDNS 廣播的裝置是不是已經連上了。
+        """
+        m = re.match(r"^adb-(.+)-[^-]+$", name or "")
+        return m.group(1) if m else ""
+
+    def _load_known(self):
+        """讀取曾經連線成功的無線裝置（以硬體序號為 key）"""
+        return load_known()
+
+    def _save_known(self, known):
+        try:
+            with open(KNOWN_PATH, "w", encoding="utf-8") as f:
+                json.dump(known, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _remember_connected(self):
+        """把目前以 IP:port 連線的無線裝置記進 known_devices.json
+
+        為什麼需要這份紀錄：mDNS 有個結構性限制 —— 裝置一旦被連上就
+        停止廣播 _adb-tls-connect._tcp（實測兩台都連線時 adb mdns services
+        為空）。因此裝置掉線後、Android 恢復廣播前的空窗期，mDNS 探索
+        完全找不到它。而 IP:port 在掉線後仍然有效，記住它才能自動重連。
+        """
+        wireless = [
+            t for t in self._get_devices(unique=False)
+            if re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d+$", t)
+        ]
+        if not wireless:
+            return
+        info = self._device_info(wireless)
+        known = self._load_known()
+        for t in wireless:
+            serial = info.get(t, {}).get("serial")
+            if not serial:
+                continue
+            known[serial] = {
+                "addr": t,
+                "serial": serial,
+                "model": info.get(t, {}).get("model", ""),
+            }
+        self._save_known(known)
 
     def _validate_addr(self, addr):
         """驗證 IP:Port 或 hostname:Port 格式，防止指令注入"""
         return bool(re.match(r"^[\w.\-]+:\d{1,5}$", addr))
+
+    def _resolve_targets(self, requested=None):
+        """決定這次操作要對哪一批裝置下指令
+
+        原本的寫法只在「剛好 1 台」時才加 -s，2 台以上 adb_args 為空，
+        adb 會直接回 "more than one device/emulator" 而整個操作失敗。
+
+        策略（由使用者決定）：
+          1. requested 有指定 → 過濾掉已離線的，只對還在線上的動作
+          2. requested 未指定且多台 → 不猜，要求前端明確勾選
+          3. 模擬器不排除（emulator-* 一視同仁視為可安裝目標）
+
+        Args:
+            requested: 前端指定的裝置 serial 清單；None 表示未指定
+        Returns:
+            (targets, skipped, error)
+            targets 為要執行的 serial list，skipped 為已離線而被略過的 serial list，
+            error 為錯誤訊息或 None
+        """
+        devices = self._get_devices()
+        if not devices:
+            return [], [], "尚未連線任何裝置"
+
+        if requested:
+            targets = [d for d in requested if d in devices]
+            skipped = [d for d in requested if d not in devices]
+            if not targets:
+                return [], skipped, "指定的裝置都已離線：" + ", ".join(skipped)
+            return targets, skipped, None
+
+        if len(devices) == 1:
+            return devices, [], None
+
+        return [], [], (
+            f"目前已連線 {len(devices)} 台裝置，請先在上方勾選要操作的目標：\n"
+            + "\n".join(f"  - {d}" for d in devices)
+        )
+
+    def _run_on_targets(self, targets, build_args, label="操作", skipped=None):
+        """對每台目標裝置依序執行指令，回傳彙總結果
+
+        build_args(serial) 需回傳該台裝置要執行的 adb 參數 list。
+        單台失敗不中止 —— 繼續處理其餘裝置，最後逐台列出結果，
+        讓沒更新成功的機器一眼可見（避免版本不一致被隱藏）。
+        """
+        results = []
+        failed = []
+        for serial in targets:
+            r = self._run_adb(["-s", serial] + build_args(serial))
+            if not r["success"]:
+                failed.append(serial)
+            mark = "成功" if r["success"] else "失敗"
+            results.append(f"[{serial}] {mark}\n{r['output'].strip()}")
+
+        ok_count = len(targets) - len(failed)
+        summary = [f"{label}完成：{ok_count}/{len(targets)} 台成功"]
+        if failed:
+            summary.append("失敗裝置：" + ", ".join(failed))
+        if skipped:
+            summary.append("已離線略過：" + ", ".join(skipped))
+        return {
+            "success": not failed,
+            "output": "\n".join(summary) + "\n\n" + "\n\n".join(results),
+        }
+
+    def _tcp_probe(self, ip, port, timeout=1.0):
+        """確認 ip:port 真的有人在聽
+
+        兩個用途：驗證 mDNS 解析出的位址是否正確，以及在 adb connect 之前
+        快速判斷位址是否還活著 —— adb connect 對死掉的位址要卡約 2 分鐘才
+        逾時（實測），先探測可以把它變成 1 秒內的明確失敗。
+        實測活著的區網 port 會立刻回應，死掉的則在 0.4/2/5 秒都一律逾時。
+        """
+        return tcp_probe(ip, port, timeout)
+
+    def _resolve_host_candidates(self, hostname):
+        """取得主機名的所有 A record 候選 IP
+
+        Android 的 adb mDNS 廣播常使用通用主機名（實測為 Android.local），
+        多台裝置會共用同一個名字，因此這裡必須取回「全部」候選，
+        再由呼叫端用 SRV port 做 TCP 探測來判斷是哪一台。
+        """
+        ips = []
+        try:
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                ip = info[4][0]
+                if ip not in ips:
+                    ips.append(ip)
+        except (socket.gaierror, OSError):
+            pass
+        return ips
 
     def _mdns_scan(self, service_type, timeout=3):
         """使用 mDNS 掃描區網內的 ADB 裝置"""
@@ -818,35 +1095,65 @@ class ADBHandler(BaseHTTPRequestHandler):
                 r"\s*[\d:\.]+\s+Add\s+\d+\s+\d+\s+\S+\s+\S+\s+(.+)", line
             )
             if m:
-                instances.append(m.group(1).strip())
+                name = m.group(1).strip()
+                if name not in instances:  # dns-sd 每個介面各報一次，需去重
+                    instances.append(name)
 
-        # Step 2: 解析每個實例的 IP 和 Port
-        devices = []
-        for instance in instances:
-            proc = subprocess.Popen(
-                ["dns-sd", "-L", instance, service_type],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            try:
-                output, _ = proc.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.terminate()
-                output, _ = proc.communicate()
+        # Step 2: 並行解析每個實例的 IP 和 Port
+        # 序列執行時每台要等滿 3 秒逾時，5 台就要 15 秒，多台情境下體感等同「掃不到」
+        if not instances:
+            return []
+        with ThreadPoolExecutor(max_workers=min(8, len(instances))) as pool:
+            resolved = list(pool.map(
+                lambda i: self._resolve_instance_darwin(i, service_type), instances
+            ))
+        return [d for d in resolved if d]
 
-            m = re.search(r"can be reached at (.+?):(\d+)", output)
-            if m:
-                hostname = m.group(1).rstrip(".")
-                port = m.group(2)
-                try:
-                    ip = socket.gethostbyname(hostname)
-                except socket.gaierror:
-                    ip = hostname
-                devices.append({
-                    "name": instance,
-                    "addr": f"{ip}:{port}",
-                    "hostname": hostname,
-                })
-        return devices
+    def _resolve_instance_darwin(self, instance, service_type):
+        """macOS: 用 dns-sd -L 解析單一 mDNS 實例的位址"""
+        proc = subprocess.Popen(
+            ["dns-sd", "-L", instance, service_type],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        try:
+            output, _ = proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            output, _ = proc.communicate()
+
+        m = re.search(r"can be reached at (.+?):(\d+)", output)
+        if not m:
+            return None
+        hostname = m.group(1).rstrip(".")
+        port = m.group(2)
+
+        # SRV record 只給主機名，且 Android 多台會共用 Android.local。
+        # 取回所有候選 IP，再用 SRV port 做 TCP 探測認人：
+        # 只有真正在廣播這個 port 的那台會接受連線。
+        candidates = self._resolve_host_candidates(hostname)
+        ip = None
+        if len(candidates) == 1:
+            ip = candidates[0]
+        else:
+            for cand in candidates:
+                if self._tcp_probe(cand, port):
+                    ip = cand
+                    break
+
+        entry = {
+            "name": instance,
+            "hostname": hostname,
+            "port": port,
+            "source": "dns-sd",
+        }
+        if ip:
+            entry["addr"] = f"{ip}:{port}"
+        else:
+            # 無法確定是哪一台 —— 寧可回報「位址未知」也不要給錯的 IP，
+            # 給錯 IP 會導致 APK 裝到別台機器上。
+            entry["addr"] = ""
+            entry["unresolved"] = True
+        return entry
 
     def _mdns_scan_linux(self, service_type, timeout):
         """Linux: 使用 avahi-browse 掃描"""
@@ -876,69 +1183,171 @@ class ADBHandler(BaseHTTPRequestHandler):
         return devices
 
     def _adb_mdns_services(self, filter_type=None):
-        """使用 adb mdns services 查詢 ADB 內建的 mDNS 追蹤結果"""
+        """使用 adb mdns services 查詢 ADB 內建的 mDNS 追蹤結果
+
+        這是最可靠的來源：adb 自帶的 openscreen mDNS daemon 會持續追蹤，
+        且直接從同一個回應封包取出 A record，回傳真正的 per-device IP
+        （不像 dns-sd 只給通用主機名 Android.local，多台裝置會撞號）。
+
+        輸出格式（欄位以 tab 分隔，行首即為服務名稱，不是縮排）：
+            List of discovered mdns services
+            adb-XXXX-yyyy\t_adb-tls-pairing._tcp\t192.168.1.59:35825
+        """
         try:
             r = subprocess.run(
                 [ADB_PATH, "mdns", "services"],
                 capture_output=True, text=True, timeout=5
             )
-            devices = []
-            for line in r.stdout.splitlines():
-                if not line.startswith("\t") and not line.startswith(" "):
-                    continue
-                parts = line.split()
-                # 格式: name  service_type  addr:port
-                if len(parts) >= 3:
-                    name = parts[0]
-                    svc_type = parts[1]
-                    addr = parts[2]
-                    if filter_type and filter_type not in svc_type:
-                        continue
-                    devices.append({
-                        "name": name,
-                        "addr": addr,
-                        "hostname": "",
-                        "source": "adb-mdns",
-                    })
-            return devices
         except Exception:
             return []
 
-    def _discover_connectable(self):
-        """綜合偵測所有可連線的裝置（已連線 + mDNS 待連線 + ADB mdns 追蹤）"""
+        devices = []
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            # 格式: name  service_type  addr:port
+            if len(parts) < 3:
+                continue
+            name, svc_type, addr = parts[0], parts[1], parts[2]
+            # 跳過標題列與任何非 ADB 服務的雜訊
+            if "_adb" not in svc_type:
+                continue
+            if filter_type and filter_type not in svc_type:
+                continue
+            if not self._validate_addr(addr):
+                continue
+            devices.append({
+                "name": name,
+                "addr": addr,
+                "hostname": "",
+                "source": "adb-mdns",
+            })
+        return devices
+
+    def _discover_mdns(self, service_type):
+        """合併兩個 mDNS 來源，以 adb mdns services 為權威
+
+        service_type 例: "_adb-tls-pairing._tcp" / "_adb-tls-connect._tcp"
+
+        以「mDNS 服務名稱」（例 adb-NDS228XGA508F0716-4rbguv）作為裝置身分去重，
+        而不是用 addr —— 因為同一台裝置的 pairing port 與 connect port 不同，
+        addr 無法代表裝置identity。
+        """
+        svc_filter = service_type.split(".")[0]  # _adb-tls-pairing
+        by_name = {}
+
+        # 1. adb 自帶的 openscreen daemon：位址正確且跨平台（含 Windows）
+        for dev in self._adb_mdns_services(svc_filter):
+            by_name[dev["name"]] = {
+                "name": dev["name"],
+                "addr": dev["addr"],
+                "source": "adb-mdns",
+            }
+
+        # 2. 系統層 dns-sd / avahi：補 adb daemon 漏掉的裝置
+        for dev in self._mdns_scan(service_type):
+            if dev["name"] in by_name:
+                continue  # 已有權威位址，不用次級來源覆蓋
+            by_name[dev["name"]] = {
+                "name": dev["name"],
+                "addr": dev.get("addr", ""),
+                "source": "dns-sd",
+                "unresolved": dev.get("unresolved", False),
+            }
+
+        return list(by_name.values())
+
+    def _discover_connectable(self, auto_reconnect=False):
+        """綜合偵測所有可連線的裝置
+
+        三個來源，缺一不可：
+          1. adb devices          —— 已連線的
+          2. mDNS                 —— 尚未連線、正在廣播的
+          3. known_devices.json   —— 曾連線成功、目前沒在廣播的
+
+        第 3 個來源是關鍵：裝置一被連上就停止廣播 _adb-tls-connect，掉線後
+        在恢復廣播前 mDNS 完全找不到它，只有記住的 IP:port 能把它救回來。
+        """
         found = []
-        seen_addrs = set()
+
+        # 先把目前連線中的位址記下來，供日後掉線重連使用
+        self._remember_connected()
+        known = self._load_known()
 
         # 1. adb devices — 已連線的裝置
+        #    以硬體序號（而非 transport 字串裡的 IP）判斷「是否已連線」：
+        #    adb 的 ADB_MDNS_AUTO_CONNECT 會用 mDNS 服務名連線，那種 transport
+        #    字串裡根本沒有 IP。若用字串比對，這台會被誤判成「待連線」，
+        #    使用者再按一次連線就會讓同一台機器產生第二個 transport。
         connected = self._get_devices()
+        info = self._device_info(connected)
+        seen_serials = set()
         for dev in connected:
-            if ":" in dev:  # 無線裝置格式為 ip:port
-                found.append({
-                    "name": dev,
-                    "addr": dev,
-                    "status": "已連線",
-                })
-                seen_addrs.add(dev)
+            serial = info.get(dev, {}).get("serial", "")
+            is_wireless = ":" in dev or "._tcp" in dev
+            if not is_wireless:
+                continue
+            if serial:
+                seen_serials.add(serial)
+            # 顯示用位址優先取 IP:port —— mDNS 服務名掉線後即失效，無法重連
+            addr = dev if self._validate_addr(dev) else known.get(serial, {}).get("addr", "")
+            label = info.get(dev, {}).get("model") or dev
+            found.append({
+                "name": f"{label} ({serial})" if serial else dev,
+                "addr": addr,
+                "status": "已連線",
+            })
 
-        # 2. adb mdns services — ADB 自己追蹤到的
-        for dev in self._adb_mdns_services("_adb-tls-connect"):
-            if dev["addr"] not in seen_addrs:
+        # 2. mDNS 探索尚未連線的裝置
+        for dev in self._discover_mdns("_adb-tls-connect._tcp"):
+            mdns_serial = self._serial_from_mdns_name(dev["name"])
+            if mdns_serial and mdns_serial in seen_serials:
+                continue
+            if dev.get("unresolved"):
                 found.append({
                     "name": dev["name"],
-                    "addr": dev["addr"],
-                    "status": "待連線 (ADB mdns)",
+                    "addr": "",
+                    "status": "偵測到但位址未確定（請手動輸入）",
                 })
-                seen_addrs.add(dev["addr"])
+                continue
+            found.append({
+                "name": dev["name"],
+                "addr": dev["addr"],
+                "status": f"待連線 ({dev['source']})",
+            })
+            if mdns_serial:
+                seen_serials.add(mdns_serial)
 
-        # 3. dns-sd / avahi — 系統層 mDNS 掃描
-        for dev in self._mdns_scan("_adb-tls-connect._tcp"):
-            if dev["addr"] not in seen_addrs:
-                found.append({
-                    "name": dev["name"],
-                    "addr": dev["addr"],
-                    "status": "待連線 (mDNS)",
-                })
-                seen_addrs.add(dev["addr"])
+        # 3. 曾連線過但目前沒在廣播的裝置：TCP 探測確認是否還活著
+        pending = []
+        for serial, rec in known.items():
+            addr = rec.get("addr", "")
+            if serial in seen_serials:
+                continue
+            if not addr or not self._validate_addr(addr):
+                continue
+            pending.append((serial, rec, addr))
+
+        if pending:
+            with ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
+                alive = list(pool.map(
+                    lambda p: self._tcp_probe(*p[2].split(":")), pending
+                ))
+            for (serial, rec, addr), ok in zip(pending, alive):
+                label = rec.get("model") or serial
+                if ok and auto_reconnect:
+                    r = self._run_adb(["connect", addr], timeout=15)
+                    found.append({
+                        "name": f"{label} ({serial})",
+                        "addr": addr,
+                        "status": "已自動重連" if r["success"] else "重連失敗，請手動連線",
+                    })
+                else:
+                    found.append({
+                        "name": f"{label} ({serial})",
+                        "addr": addr,
+                        "status": "曾連線過，可重連" if ok else "曾連線過（目前無回應）",
+                    })
+                seen_serials.add(serial)
 
         return found
 
@@ -1022,9 +1431,17 @@ class ADBHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, "output": "\n\n".join(info)})
 
         elif self.path == "/api/discover-connect":
-            self._read_body()
+            body = self._read_body()
             try:
-                devices = self._discover_connectable()
+                opts = json.loads(body) if body else {}
+            except ValueError:
+                opts = {}
+            try:
+                # 按下「掃描」是明確的使用者動作，因此順手把曾連線過、
+                # 目前 TCP 探測有回應的裝置自動接回來
+                devices = self._discover_connectable(
+                    auto_reconnect=opts.get("autoReconnect", True)
+                )
                 if devices:
                     self._send_json({
                         "success": True,
@@ -1048,7 +1465,7 @@ class ADBHandler(BaseHTTPRequestHandler):
             else:
                 service = "_adb-tls-connect._tcp"
             try:
-                devices = self._mdns_scan(service)
+                devices = self._discover_mdns(service)
                 if devices:
                     self._send_json({
                         "success": True,
@@ -1106,7 +1523,18 @@ class ADBHandler(BaseHTTPRequestHandler):
             if not self._validate_addr(addr):
                 self._send_json({"success": False, "output": "位址格式不正確，應為 IP:Port (例: 192.168.1.100:43567)"})
                 return
-            result = self._run_adb(["connect", addr])
+            # 先探測再連線：adb connect 對死掉的位址要卡約 2 分鐘才逾時
+            host, _, port = addr.rpartition(":")
+            if not self._tcp_probe(host, port, timeout=2.0):
+                self._send_json({"success": False, "output": (
+                    f"{addr} 沒有回應，這個位址已失效。\n"
+                    "無線偵錯的 port 在下列情況會改變：\n"
+                    "1. 裝置關閉再重新開啟「無線偵錯」\n"
+                    "2. 裝置重開機或離開 Wi-Fi\n"
+                    "請在裝置上確認無線偵錯仍開啟，再按上方「掃描已配對裝置」取得新的位址。"
+                )})
+                return
+            result = self._run_adb(["connect", addr], timeout=30)
             if result.get("timeout"):
                 responsive = self._adb_server_responsive()
                 if not responsive:
@@ -1121,6 +1549,9 @@ class ADBHandler(BaseHTTPRequestHandler):
                 output_lower = result["output"].lower()
                 if "failed" in output_lower or "cannot" in output_lower or "error" in output_lower:
                     result["success"] = False
+            if result["success"]:
+                # 記住這個位址：裝置連上後會停止 mDNS 廣播，掉線時只能靠這份紀錄重連
+                self._remember_connected()
             self._send_json(result)
 
         elif self.path == "/api/list-remote-apk":
@@ -1129,19 +1560,17 @@ class ADBHandler(BaseHTTPRequestHandler):
             if not remote_dir.startswith("/"):
                 self._send_json({"success": False, "output": "路徑必須以 / 開頭"})
                 return
-            # 取得目標裝置參數
-            devices = self._get_devices()
-            adb_args = []
-            if len(devices) == 0:
-                self._send_json({"success": False, "output": "尚未連線任何裝置"})
+            targets, skipped, err = self._resolve_targets(data.get("devices"))
+            if err:
+                self._send_json({"success": False, "output": err})
                 return
-            elif len(devices) == 1:
-                adb_args = ["-s", devices[0]]
-            result = self._run_adb(adb_args + ["shell", "ls", remote_dir])
+            # 列檔只需一台代表（同型 POS 機路徑相同），取第一台勾選的裝置
+            probe = targets[0]
+            result = self._run_adb(["-s", probe, "shell", "ls", remote_dir])
             if result["success"]:
                 files = [f.strip() for f in result["output"].splitlines() if f.strip().endswith(".apk")]
                 if files:
-                    self._send_json({"success": True, "files": files, "output": f"找到 {len(files)} 個 APK"})
+                    self._send_json({"success": True, "files": files, "output": f"從 {probe} 找到 {len(files)} 個 APK"})
                 else:
                     self._send_json({"success": False, "output": f"在 {remote_dir} 中未找到 APK 檔案\n" + result["output"]})
             else:
@@ -1180,18 +1609,14 @@ class ADBHandler(BaseHTTPRequestHandler):
             if not os.path.isfile(local_path):
                 self._send_json({"success": False, "output": f"檔案不存在: {local_path}"})
                 return
-            devices = self._get_devices()
-            adb_args = []
-            if len(devices) == 0:
-                self._send_json({"success": False, "output": "尚未連線任何裝置"})
+            targets, skipped, err = self._resolve_targets(data.get("devices"))
+            if err:
+                self._send_json({"success": False, "output": err})
                 return
-            elif len(devices) == 1:
-                adb_args = ["-s", devices[0]]
-            elif len(devices) > 1:
-                self._send_json({"success": False, "output": f"偵測到 {len(devices)} 台裝置，請先在步驟 4 選擇目標裝置"})
-                return
-            result = self._run_adb(adb_args + ["install", local_path])
-            self._send_json(result)
+            self._send_json(self._run_on_targets(
+                targets, lambda s: ["install", local_path],
+                label="安裝", skipped=skipped,
+            ))
 
         elif self.path == "/api/pull-and-install":
             data = json.loads(self._read_body())
@@ -1203,29 +1628,30 @@ class ADBHandler(BaseHTTPRequestHandler):
             if not remote_dir.startswith("/"):
                 self._send_json({"success": False, "output": "路徑必須以 / 開頭"})
                 return
-            devices = self._get_devices()
-            adb_args = []
-            if len(devices) == 0:
-                self._send_json({"success": False, "output": "尚未連線任何裝置"})
+            targets, skipped, err = self._resolve_targets(data.get("devices"))
+            if err:
+                self._send_json({"success": False, "output": err})
                 return
-            elif len(devices) == 1:
-                adb_args = ["-s", devices[0]]
             remote_path = remote_dir + filename
-            # Step 1: adb pull 拉到本機
+            # Step 1: 從第一台勾選的裝置 adb pull 拉到本機（只需拉一次）
             local_dir = os.path.join(_dir, "pulled_apk")
             os.makedirs(local_dir, exist_ok=True)
             local_path = os.path.join(local_dir, filename)
-            pull_result = self._run_adb(adb_args + ["pull", remote_path, local_path])
+            source = targets[0]
+            pull_result = self._run_adb(["-s", source, "pull", remote_path, local_path])
             if not pull_result["success"]:
-                pull_result["output"] = f"拉取失敗: {pull_result['output']}"
+                pull_result["output"] = f"從 {source} 拉取失敗: {pull_result['output']}"
                 self._send_json(pull_result)
                 return
-            # Step 2: adb install 從本機安裝
-            install_result = self._run_adb(adb_args + ["install", local_path])
+            # Step 2: 把同一份 APK 安裝到所有勾選的裝置
+            install_result = self._run_on_targets(
+                targets, lambda s: ["install", local_path],
+                label="安裝", skipped=skipped,
+            )
             install_result["output"] = (
-                f"[拉取] {pull_result['output']}\n"
-                f"[安裝] {install_result['output']}\n"
-                f"本機備份: {local_path}"
+                f"[拉取] 來源 {source}：{pull_result['output'].strip()}\n"
+                f"本機備份: {local_path}\n\n"
+                + install_result["output"]
             )
             self._send_json(install_result)
 
@@ -1239,16 +1665,15 @@ class ADBHandler(BaseHTTPRequestHandler):
             if not remote_dir.startswith("/"):
                 self._send_json({"success": False, "output": "路徑必須以 / 開頭"})
                 return
-            devices = self._get_devices()
-            adb_args = []
-            if len(devices) == 0:
-                self._send_json({"success": False, "output": "尚未連線任何裝置"})
+            targets, skipped, err = self._resolve_targets(data.get("devices"))
+            if err:
+                self._send_json({"success": False, "output": err})
                 return
-            elif len(devices) == 1:
-                adb_args = ["-s", devices[0]]
             remote_path = remote_dir + filename
-            result = self._run_adb(adb_args + ["shell", "pm", "install", "-r", remote_path])
-            self._send_json(result)
+            self._send_json(self._run_on_targets(
+                targets, lambda s: ["shell", "pm", "install", "-r", remote_path],
+                label="裝置端安裝", skipped=skipped,
+            ))
 
         elif self.path == "/api/install":
             content_type = self.headers.get("Content-Type", "")
@@ -1272,7 +1697,10 @@ class ADBHandler(BaseHTTPRequestHandler):
                 if part_body.endswith(b"\r\n"):
                     part_body = part_body[:-2]
 
-                if b'name="device"' in part:
+                if b'name="devices"' in part:
+                    # 前端以逗號分隔傳多台勾選的裝置
+                    device = part_body.decode().strip()
+                elif b'name="device"' in part:
                     device = part_body.decode().strip()
                 elif b'name="apk"' in part:
                     match = re.search(rb'filename="([^"]+)"', part)
@@ -1284,24 +1712,27 @@ class ADBHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "output": "請選擇 .apk 檔案"})
                 return
 
-            # 決定是否指定裝置
-            adb_args = []
-            if device and re.match(r"^[\w.\-:]+$", device):
-                adb_args = ["-s", device]
-            else:
-                # 自動偵測：多台時報錯提示選擇
-                devices = self._get_devices()
-                if len(devices) > 1:
-                    self._send_json({"success": False, "output": f"偵測到 {len(devices)} 台裝置，請選擇目標裝置"})
-                    return
+            # 決定目標裝置（device 欄位可為逗號分隔的多台）
+            requested = None
+            if device:
+                requested = [
+                    s.strip() for s in device.split(",")
+                    if s.strip() and re.match(r"^[\w.\-:]+$", s.strip())
+                ]
+            targets, skipped, err = self._resolve_targets(requested)
+            if err:
+                self._send_json({"success": False, "output": err})
+                return
 
             # 儲存到暫存檔
             tmp = tempfile.NamedTemporaryFile(suffix=".apk", delete=False)
             try:
                 tmp.write(file_data)
                 tmp.close()
-                result = self._run_adb(adb_args + ["install", tmp.name])
-                self._send_json(result)
+                self._send_json(self._run_on_targets(
+                    targets, lambda s: ["install", tmp.name],
+                    label="安裝", skipped=skipped,
+                ))
             finally:
                 os.unlink(tmp.name)
         else:
@@ -1326,6 +1757,8 @@ def main():
     try:
         subprocess.run([ADB_PATH, "start-server"], capture_output=True, timeout=10)
         print("ADB server 已重啟")
+        # kill-server 會踢掉所有無線連線，把曾連線過的裝置自動接回來
+        reconnect_known()
     except subprocess.TimeoutExpired:
         print("ADB server 啟動逾時，跳過（可在網頁上手動重啟）")
 

@@ -3,6 +3,9 @@ __pycache__/
 pulled_apk/
 .claude/
 
+# 曾連線裝置的位址紀錄（每台機器各自不同）
+known_devices.json
+
 # ADB binaries (auto-downloaded at runtime)
 adb
 adb.exe
