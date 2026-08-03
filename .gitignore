@@ -12,3 +12,5 @@ adb.exe
 AdbWinApi.dll
 AdbWinUsbApi.dll
 platform-tools.zip
+
+.adb_tool.pid

@@ -9,6 +9,10 @@ import tempfile
 import platform
 import socket
 import zipfile
+import errno
+import signal
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import urlretrieve
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -19,6 +23,7 @@ ADB_NAME = "adb.exe" if _system == "Windows" else "adb"
 ADB_PATH = os.path.join(_dir, ADB_NAME)
 KNOWN_PATH = os.path.join(_dir, "known_devices.json")
 PORT = 8080
+PID_FILE = os.path.join(_dir, ".adb_tool.pid")
 
 _PLATFORM_TOOLS_URLS = {
     "Darwin": "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
@@ -62,6 +67,74 @@ def tcp_probe(ip, port, timeout=1.0):
             return True
     except (OSError, ValueError):
         return False
+
+
+# 掃描併發度：實測 128 以上會被裝置的 SYN backlog 丟包而漏掃（同一台機器
+# 明明開著的 port 掃不到），64 在 20000 個 port 的範圍重複測試都穩定。
+ADB_SCAN_WORKERS = 64
+ADB_SCAN_TIMEOUT = 1.0
+
+
+def host_state(ip, timeout=2.0):
+    """判斷主機在網路上的狀態。
+
+    看「關閉的 port 回什麼」來分辨，比 ping 可靠 —— 裝置的省電模式常會
+    過濾 ICMP，卻仍然正常回 RST：
+      awake       收到 RST：IP 層正常運作，只是那個 port 沒服務
+      asleep      逾時無回應：封包送得到但沒人處理（睡眠／關機）
+      unreachable 網路層錯誤：根本不在網路上
+    """
+    for port in (1, 9):
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                return "awake"  # 居然開著，總之它醒著
+        except ConnectionRefusedError:
+            return "awake"
+        except (socket.timeout, TimeoutError):
+            continue
+        except OSError as e:
+            if e.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EHOSTDOWN):
+                return "unreachable"
+            continue
+    return "asleep"
+
+
+def scan_ports(ip, ports, timeout=ADB_SCAN_TIMEOUT):
+    """回傳這些 port 裡有人在聽的"""
+    def probe(p):
+        try:
+            with socket.create_connection((ip, p), timeout=timeout):
+                return p
+        except OSError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=ADB_SCAN_WORKERS) as pool:
+        return sorted(p for p in pool.map(probe, ports) if p)
+
+
+def scan_bands(last_port=None):
+    """由窄到寬的掃描範圍，找到就停，讓運氣好的情況幾秒內結束。
+
+    醒著的裝置對關閉的 port 立刻回 RST，所以掃描主要花在範圍大小上：
+    完整 ephemeral 範圍約 70 秒，鄰近範圍只要 2~3 秒。
+
+    前兩段只是賭運氣：實測樣本 36105 / 36707 / 36987 / 42599 顯示
+    Android 挑 port 相當隨機，36xxx 只是巧合而非規律。真正的保障是
+    第三段的完整範圍，前兩段賭中就省時間、賭不中也只多花幾秒。
+    """
+    bands, seen = [], set()
+
+    def add(lo, hi):
+        ports = [p for p in range(lo, hi + 1) if p not in seen]
+        if ports:
+            seen.update(ports)
+            bands.append(ports)
+
+    if last_port:
+        add(max(30000, last_port - 1000), min(65535, last_port + 1000))
+    add(35000, 38000)
+    add(30000, 50000)
+    return bands
 
 
 def load_known():
@@ -1050,6 +1123,126 @@ class ADBHandler(BaseHTTPRequestHandler):
         """
         return tcp_probe(ip, port, timeout)
 
+    def _probe_via_peer(self, target_ip):
+        """借用另一台已連線的裝置去 ping 目標。
+
+        單靠本機探測永遠分不出「裝置故障」和「本機到不了它」—— 兩者都是
+        靜默無回應。但只要同網段還有一台已經連上的裝置，就可以請它代為
+        ping：它 ping 得到，就證明裝置活著，是本機這條路徑被擋住。
+
+        回傳 (結果, 代打的裝置)。結果為 "alive"／"dead"，沒有可用的幫手
+        時回傳 (None, None)。
+        """
+        # 這個值會被拼進 adb shell 的指令字串，所以在這裡自己再驗一次。
+        # 上游 _validate_addr 已經擋掉 shell 元字元，但那是隔了好幾層的
+        # 遠端保護 —— 直接呼叫本函式的人不該因此中招。
+        # 註：改成 argv 分開傳參沒有用，adb shell 會把參數接回成字串
+        # 交給裝置端的 shell，唯一有效的控制就是驗證值本身。
+        if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", target_ip):
+            return None, None
+
+        prefix = target_ip.rsplit(".", 1)[0] + "."
+        peers = [
+            t for t in self._get_devices(unique=False)
+            if re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d+$", t)
+            and t.startswith(prefix)
+            and not t.startswith(target_ip + ":")
+        ]
+        for peer in peers:
+            r = self._run_adb(
+                ["-s", peer, "shell", f"ping -c 2 -W 2 {target_ip}"], timeout=20)
+            m = re.search(r"(\d+)\s+received", r.get("output", ""))
+            if m:
+                return ("alive" if int(m.group(1)) > 0 else "dead"), peer
+        return None, None
+
+    def _diagnose_addr(self, addr):
+        """位址連不上時，判斷到底是哪一種failure，因為處置方式完全不同。
+
+        回傳 (state, 訊息)。state 為 host_state() 的三種值之一。
+        """
+        ip = addr.rpartition(":")[0]
+        state = host_state(ip)
+        if state == "unreachable":
+            msg = (
+                f"{ip} 不在網路上。\n"
+                "可能是裝置換了 IP、離開了 Wi-Fi，或連到別的網段。\n"
+                "請按「掃描已配對裝置」重新探索。"
+            )
+        elif state == "asleep":
+            # 本機探測到此為止就分不下去了（「裝置沒在運作」和「路徑被擋」
+            # 的現象完全相同），改借用同網段已連線的裝置當探針。
+            peer_result, peer = self._probe_via_peer(ip)
+            if peer_result == "alive":
+                msg = (
+                    f"{ip} 從這台電腦完全不通，但另一台已連線的裝置\n"
+                    f"（{peer}）ping 得到它 —— 所以裝置是好的，\n"
+                    "是「這台電腦到它」的網路路徑被擋住了。\n"
+                    "常見原因與處置：\n"
+                    "1. 兩者關聯到不同的 Wi-Fi AP —— 把電腦的 Wi-Fi 關掉再打開\n"
+                    "2. AP 開了用戶端隔離 —— 檢查路由器／AP 設定\n"
+                    "3. 裝置連到不同的 SSID（例如訪客網路）—— 確認裝置的 Wi-Fi"
+                )
+            elif peer_result == "dead":
+                msg = (
+                    f"{ip} 從這台電腦和另一台已連線的裝置（{peer}）都 ping 不到，\n"
+                    "所以是裝置本身睡著或關機了。\n"
+                    "請到機器旁邊碰一下螢幕或按電源鍵喚醒它，再重試。"
+                )
+            else:
+                # 沒有同網段的幫手可借，只能列出所有可能
+                msg = (
+                    f"{ip} 沒有回應任何封包（連關閉的 port 都不回 RST）。\n"
+                    "可能原因：\n"
+                    "1. 裝置睡著或關機 —— 碰一下螢幕喚醒它\n"
+                    "2. 裝置其實已換到別的 IP —— 請看裝置上「無線偵錯」畫面\n"
+                    "   顯示的 IP 是不是還是這個\n"
+                    "3. Wi-Fi AP 開了用戶端隔離，擋掉電腦與裝置之間的連線\n"
+                    "4. 裝置的防火牆靜默丟棄封包"
+                )
+        else:
+            msg = f"{ip} 有回應，但 {addr} 這個 port 已經不是 adbd 了。"
+        return state, msg
+
+    def _recover_addr(self, addr):
+        """裝置還醒著但 port 變了時，掃描找回新的 adbd port 並重新連線。
+
+        為什麼這樣行得通：Android 的無線偵錯配對是持久的 —— 一旦配對過，
+        裝置就信任這台主機的金鑰。port 改變並不會使配對失效，所以只要找到
+        新 port 直接 connect 就會成功，不需要重新配對，也不用去動裝置上的
+        「無線偵錯」開關。
+
+        回傳 (成功與否, 訊息)。
+        """
+        ip, _, old_port = addr.rpartition(":")
+        last = int(old_port) if old_port.isdigit() else None
+
+        # 先問 mDNS：裝置只要開著無線偵錯就會廣播當前 port，幾秒就有精確
+        # 答案。掃描是最後手段 —— 實測掃 31000 個 port 要 9 分鐘，而 mDNS
+        # 一次就直接給出正確的 port。
+        for dev in self._adb_mdns_services("_adb-tls-connect"):
+            cand = dev.get("addr", "")
+            if cand.startswith(ip + ":") and cand != addr:
+                r = self._run_adb(["connect", cand], timeout=15)
+                if "connected to" in r.get("output", "").lower():
+                    return True, f"mDNS 找到當前位址，已重新連線：{cand}"
+
+        tried = []
+        for ports in scan_bands(last):
+            for cand in scan_ports(ip, ports):
+                if cand == last:
+                    continue  # 已知連不上，別再試
+                r = self._run_adb(["connect", f"{ip}:{cand}"], timeout=15)
+                out = r.get("output", "")
+                if "connected to" in out.lower():
+                    return True, f"找到新的 port，已重新連線：{ip}:{cand}"
+                tried.append(cand)
+        detail = f"（試過 {', '.join(map(str, tried))}）" if tried else ""
+        return False, (
+            f"{ip} 醒著，但掃遍 30000-50000 都沒找到可連線的 adbd port{detail}。\n"
+            "請確認裝置上的「無線偵錯」仍然開啟。"
+        )
+
     def _resolve_host_candidates(self, hostname):
         """取得主機名的所有 A record 候選 IP
 
@@ -1332,6 +1525,15 @@ class ADBHandler(BaseHTTPRequestHandler):
                 alive = list(pool.map(
                     lambda p: self._tcp_probe(*p[2].split(":")), pending
                 ))
+            # 位址不通的，再判斷是「睡著」還是「port 換了」—— 使用者要採取的
+            # 行動完全不同，籠統說「無回應」只會把人導向錯誤的排除步驟。
+            dead = [p[2] for p, ok in zip(pending, alive) if not ok]
+            states = {}
+            if dead:
+                with ThreadPoolExecutor(max_workers=min(8, len(dead))) as pool:
+                    states = dict(zip(dead, pool.map(
+                        lambda a: host_state(a.rpartition(":")[0]), dead
+                    )))
             for (serial, rec, addr), ok in zip(pending, alive):
                 label = rec.get("model") or serial
                 if ok and auto_reconnect:
@@ -1345,7 +1547,11 @@ class ADBHandler(BaseHTTPRequestHandler):
                     found.append({
                         "name": f"{label} ({serial})",
                         "addr": addr,
-                        "status": "曾連線過，可重連" if ok else "曾連線過（目前無回應）",
+                        "status": "曾連線過，可重連" if ok else {
+                            "awake": "裝置醒著但 port 已變 —— 按「連線」可自動找回",
+                            "asleep": "完全無回應（睡著／換了 IP／被 AP 隔離）",
+                            "unreachable": "不在網路上，IP 可能已改變",
+                        }.get(states.get(addr), "目前無回應"),
                     })
                 seen_serials.add(serial)
 
@@ -1526,13 +1732,16 @@ class ADBHandler(BaseHTTPRequestHandler):
             # 先探測再連線：adb connect 對死掉的位址要卡約 2 分鐘才逾時
             host, _, port = addr.rpartition(":")
             if not self._tcp_probe(host, port, timeout=2.0):
-                self._send_json({"success": False, "output": (
-                    f"{addr} 沒有回應，這個位址已失效。\n"
-                    "無線偵錯的 port 在下列情況會改變：\n"
-                    "1. 裝置關閉再重新開啟「無線偵錯」\n"
-                    "2. 裝置重開機或離開 Wi-Fi\n"
-                    "請在裝置上確認無線偵錯仍開啟，再按上方「掃描已配對裝置」取得新的位址。"
-                )})
+                # 連不上的原因至少有三種，處置方式完全不同，先分辨清楚
+                state, msg = self._diagnose_addr(addr)
+                if state != "awake":
+                    self._send_json({"success": False, "output": msg})
+                    return
+                # 裝置醒著 -> port 換了。配對仍然有效，掃出新 port 就能接回來
+                ok, recover_msg = self._recover_addr(addr)
+                if ok:
+                    self._remember_connected()
+                self._send_json({"success": ok, "output": f"{msg}\n{recover_msg}"})
                 return
             result = self._run_adb(["connect", addr], timeout=30)
             if result.get("timeout"):
@@ -1739,7 +1948,201 @@ class ADBHandler(BaseHTTPRequestHandler):
             self._send_json({"success": False, "output": "未知的 API"}, status=404)
 
 
+def _watch_parent():
+    """終端機視窗被關掉時自動結束自己。
+
+    macOS 關閉 Terminal 視窗不保證會送 SIGHUP 給子程序：外層 shell 被殺掉後，
+    python 會被 launchd 收養（PPID 變成 1）然後一直活著佔用 port，
+    下次啟動就撞 "Address already in use"。這裡主動偵測親代消失。
+
+    只在啟動時 PPID 不是 1 的情況下生效；若一開始就被 launchd 直接拉起，
+    這個判斷沒有意義，交給 .command 裡的 exec 處理。
+    """
+    initial_ppid = os.getppid()
+    if initial_ppid == 1:
+        return
+    while True:
+        if os.getppid() != initial_ppid:
+            os._exit(0)
+        time.sleep(2)
+
+
+def _install_exit_handlers():
+    """收到 SIGHUP／SIGTERM 時乾淨退出，而不是被留成孤兒"""
+    def _bye(signum, frame):
+        os._exit(0)
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        try:
+            signal.signal(sig, _bye)
+        except (ValueError, OSError):
+            pass
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 存在但不屬於我們
+    except OSError:
+        return False
+
+
+def _process_cwd(pid):
+    """查程序的工作目錄。ps 拿不到，只能靠 lsof。"""
+    if _system == "Windows":
+        return None
+    try:
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.startswith("n"):
+                return line[1:]
+    except Exception:
+        pass
+    return None
+
+
+def _is_our_process(pid):
+    """確認 pid 真的是本工具的另一個實例。
+
+    要夠嚴格，因為判斷錯就是殺掉無辜的程序：
+    1. PID 會被作業系統回收再利用 -> 必須核對命令列
+    2. app.py 是超常見的檔名（Flask/FastAPI 專案滿地都是）
+       -> 還要比對工作目錄，免得殺掉別的專案的開發伺服器
+    """
+    if pid is None or pid == os.getpid() or not _alive(pid):
+        return False
+    try:
+        if _system == "Windows":
+            out = subprocess.run(
+                ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine"],
+                capture_output=True, text=True, timeout=5).stdout
+        else:
+            out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return False
+    if "python" not in out.lower():
+        return False
+    # 命令列若帶絕對路徑就直接認得出來；否則退而比對工作目錄
+    if os.path.join(_dir, "app.py") in out:
+        return True
+    if "app.py" not in out:
+        return False
+    return _process_cwd(pid) == _dir
+
+
+def _kill(pid, force):
+    if _system == "Windows":
+        cmd = ["taskkill", "/PID", str(pid)] + (["/F"] if force else [])
+        subprocess.run(cmd, capture_output=True, timeout=5)
+    else:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
+def _pid_on_port(port):
+    """直接查出誰佔著這個 port。
+
+    PID 檔遺失、過期、或舊實例是在這個機制存在之前啟動的時候，
+    這是唯一還能找到它的方法。
+    """
+    if _system == "Windows":
+        return None
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True, text=True, timeout=5).stdout.split()
+        return int(out[0]) if out else None
+    except Exception:
+        return None
+
+
+def _takeover():
+    """結束上一個實例，把 port 讓出來給自己。
+
+    設計取捨：啟動這支工具是使用者的明確意圖，所以新的一定贏。
+    舊實例就算正在安裝 APK 也照樣結束 —— 反正它的視窗已經被關掉，
+    使用者看不到進度，留著它只會佔住 port 並持有過期的 adb 狀態。
+    """
+    pid = _read_pid_file()
+    if not _is_our_process(pid):
+        pid = _pid_on_port(PORT)  # PID 檔不可靠，改問誰佔著 port
+    if not _is_our_process(pid):
+        return  # 沒有舊實例，或佔用者不是本工具（不能亂殺）
+
+    print(f"偵測到另一個 ADB 遙控器實例 (PID {pid})，正在結束它...")
+    for force in (False, True):
+        try:
+            _kill(pid, force)
+        except ProcessLookupError:
+            break
+        except Exception as e:
+            print(f"結束 PID {pid} 失敗：{e}")
+            break
+        # 最多等 3 秒讓它把 port 釋放掉。
+        # 用 _is_our_process 而非只看 _alive：已結束但還沒被 reap 的 zombie
+        # 對 os.kill(pid, 0) 仍有回應，可是它早就把 port 放掉了。
+        for _ in range(30):
+            time.sleep(0.1)
+            if not _alive(pid) or not _is_our_process(pid):
+                print("舊實例已結束，接管 port")
+                return
+    print(f"警告：PID {pid} 無法結束，請手動處理")
+
+
+def _read_pid_file():
+    try:
+        with open(PID_FILE) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_pid_file():
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass  # 寫不進去只是失去接管能力，不該擋住啟動
+
+
+def _clear_pid_file():
+    """正常退出時清掉。被 SIGKILL 或 os._exit 幹掉時清不了，
+    但沒關係 —— _is_our_process() 會核對命令列，殘留的 PID 檔不會誤殺人。"""
+    try:
+        if _read_pid_file() == os.getpid():
+            os.remove(PID_FILE)
+    except OSError:
+        pass
+
+
+def _open_browser():
+    try:
+        import webbrowser
+        webbrowser.open(f"http://127.0.0.1:{PORT}")
+    except Exception:
+        pass
+
+
 def main():
+    _install_exit_handlers()
+    threading.Thread(target=_watch_parent, daemon=True).start()
+
+    # 接管與綁定都必須在 kill-server 之前完成：否則啟動失敗時，
+    # 已經先把 adb server 砍掉，會害別的東西斷線。
+    _takeover()
+    try:
+        server = HTTPServer(("127.0.0.1", PORT), ADBHandler)
+    except OSError:
+        # 舊實例已經處理過了，還綁不上就是別的服務佔著 8080
+        print(f"port {PORT} 被其他程式佔用（不是本工具，所以不會去動它），無法啟動。")
+        print(f"可以用這個指令查是誰：lsof -nP -iTCP:{PORT} -sTCP:LISTEN")
+        return
+    _write_pid_file()
+
     ensure_adb()
 
     # 重啟 adb server，避免殘留狀態導致配對失敗
@@ -1762,20 +2165,17 @@ def main():
     except subprocess.TimeoutExpired:
         print("ADB server 啟動逾時，跳過（可在網頁上手動重啟）")
 
-    server = HTTPServer(("127.0.0.1", PORT), ADBHandler)
     print(f"ADB 遙控器已啟動！")
     print(f"請在瀏覽器開啟: http://127.0.0.1:{PORT}")
     print(f"按 Ctrl+C 停止伺服器")
-    try:
-        import webbrowser
-        webbrowser.open(f"http://127.0.0.1:{PORT}")
-    except Exception:
-        pass
+    _open_browser()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n伺服器已停止")
         server.server_close()
+    finally:
+        _clear_pid_file()
 
 
 if __name__ == "__main__":
