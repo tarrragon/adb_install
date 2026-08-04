@@ -74,6 +74,11 @@ def tcp_probe(ip, port, timeout=1.0):
 ADB_SCAN_WORKERS = 64
 ADB_SCAN_TIMEOUT = 1.0
 
+# 掃描／啟動階段「快速找回新 port」的秒數上限。醒著的裝置對關閉的 port
+# 立刻回 RST，全範圍通常幾秒就掃完；會逼近上限的是丟包或限流的路徑，
+# 那種情況繼續掃也只是空等，不如把不限時的完整掃描留給使用者按「連線」。
+QUICK_RECOVER_DEADLINE = 20
+
 
 def host_state(ip, timeout=2.0):
     """判斷主機在網路上的狀態。
@@ -147,34 +152,169 @@ def load_known():
         return {}
 
 
+def save_known(known):
+    try:
+        with open(KNOWN_PATH, "w", encoding="utf-8") as f:
+            json.dump(known, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def validate_addr(addr):
+    """驗證 IP:Port 或 hostname:Port 格式，防止指令注入"""
+    return bool(re.match(r"^[\w.\-]+:\d{1,5}$", addr))
+
+
+def adb_connect(addr, timeout=15):
+    """adb connect 並回報是否真的連上（adb connect 失敗時 exit code 仍為 0）"""
+    try:
+        r = subprocess.run([ADB_PATH, "connect", addr],
+                           capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return "connected to" in (r.stdout + r.stderr).lower()
+
+
+def adb_mdns_services(filter_type=None):
+    """使用 adb mdns services 查詢 ADB 內建的 mDNS 追蹤結果
+
+    這是最可靠的來源：adb 自帶的 openscreen mDNS daemon 會持續追蹤，
+    且直接從同一個回應封包取出 A record，回傳真正的 per-device IP
+    （不像 dns-sd 只給通用主機名 Android.local，多台裝置會撞號）。
+
+    輸出格式（欄位以 tab 分隔，行首即為服務名稱，不是縮排）：
+        List of discovered mdns services
+        adb-XXXX-yyyy\t_adb-tls-pairing._tcp\t192.168.1.59:35825
+    """
+    try:
+        r = subprocess.run(
+            [ADB_PATH, "mdns", "services"],
+            capture_output=True, text=True, timeout=5
+        )
+    except Exception:
+        return []
+
+    devices = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        # 格式: name  service_type  addr:port
+        if len(parts) < 3:
+            continue
+        name, svc_type, addr = parts[0], parts[1], parts[2]
+        # 跳過標題列與任何非 ADB 服務的雜訊
+        if "_adb" not in svc_type:
+            continue
+        if filter_type and filter_type not in svc_type:
+            continue
+        if not validate_addr(addr):
+            continue
+        devices.append({
+            "name": name,
+            "addr": addr,
+            "hostname": "",
+            "source": "adb-mdns",
+        })
+    return devices
+
+
+def recover_addr(addr, deadline=None):
+    """裝置還醒著但 port 變了時，掃描找回新的 adbd port 並重新連線。
+
+    為什麼這樣行得通：Android 的無線偵錯配對是持久的 —— 一旦配對過，
+    裝置就信任這台主機的金鑰。port 改變並不會使配對失效，所以只要找到
+    新 port 直接 connect 就會成功，不需要重新配對，也不用去動裝置上的
+    「無線偵錯」開關。
+
+    先問 mDNS：裝置只要開著無線偵錯就會廣播當前 port，幾秒就有精確
+    答案。掃描是後備手段 —— 實測掃 31000 個 port 最壞要 9 分鐘，而
+    mDNS 一次就直接給出正確的 port。
+
+    deadline 限制掃描階段的總秒數（None = 不限時，掃好掃滿）。
+    回傳 (新位址或 None, 訊息)。
+    """
+    ip, _, old_port = addr.rpartition(":")
+    last = int(old_port) if old_port.isdigit() else None
+
+    for dev in adb_mdns_services("_adb-tls-connect"):
+        cand = dev.get("addr", "")
+        if cand.startswith(ip + ":") and cand != addr and adb_connect(cand):
+            return cand, f"mDNS 找到當前位址，已重新連線：{cand}"
+
+    start = time.monotonic()
+    tried, timed_out = [], False
+    for ports in scan_bands(last):
+        # 分批掃、批間檢查時限：scan_ports 一批 500 個 port 最壞約 8 秒，
+        # 讓 deadline 的誤差不至於失控
+        for i in range(0, len(ports), 500):
+            if deadline is not None and time.monotonic() - start >= deadline:
+                timed_out = True
+                break
+            for cand in scan_ports(ip, ports[i:i + 500]):
+                if cand == last:
+                    continue  # 已知連不上，別再試
+                if adb_connect(f"{ip}:{cand}"):
+                    return f"{ip}:{cand}", f"找到新的 port，已重新連線：{ip}:{cand}"
+                tried.append(cand)
+        if timed_out:
+            break
+    detail = f"（試過 {', '.join(map(str, tried))}）" if tried else ""
+    if timed_out:
+        return None, (
+            f"{ip} 醒著，但快速掃描（{deadline} 秒）內沒找到可連線的 adbd port{detail}。\n"
+            "按「連線」可進行不限時的完整掃描。"
+        )
+    return None, (
+        f"{ip} 醒著，但掃遍 30000-50000 都沒找到可連線的 adbd port{detail}。\n"
+        "請確認裝置上的「無線偵錯」仍然開啟。"
+    )
+
+
 def reconnect_known():
     """啟動時把曾連線過、目前仍可達的無線裝置接回來
 
     本程式啟動時會 kill-server 以避免殭屍狀態，副作用是所有無線連線都被踢掉。
     而裝置一旦被連上就停止廣播 _adb-tls-connect._tcp，掉線後在恢復廣播前
     mDNS 找不到它 —— 所以只能靠記住的 IP:port 把它們接回來。
+
+    位址探測不到但主機醒著時，多半是裝置重開機後 adbd 換了 port ——
+    配對仍有效，就地快速找回新 port 並把紀錄更新成新位址，
+    後續查詢才不會一直卡在過期的舊 port 上。
     """
     known = load_known()
-    targets = [
-        rec["addr"] for rec in known.values()
-        if rec.get("addr") and re.match(r"^[\w.\-]+:\d{1,5}$", rec["addr"])
+    entries = [
+        (serial, rec) for serial, rec in known.items()
+        if rec.get("addr") and validate_addr(rec["addr"])
     ]
-    if not targets:
+    if not entries:
         return
     # 先並行探測，跳過死掉的位址，避免逐個卡 2 分鐘
-    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
-        alive = list(pool.map(lambda a: tcp_probe(*a.rsplit(":", 1)), targets))
-    reachable = [a for a, ok in zip(targets, alive) if ok]
-    if not reachable:
-        print(f"曾連線的 {len(targets)} 台裝置目前皆無回應，請確認無線偵錯是否開啟")
-        return
-    for addr in reachable:
-        try:
-            r = subprocess.run([ADB_PATH, "connect", addr],
-                               capture_output=True, text=True, timeout=30)
-            print(f"  自動重連 {addr}: {r.stdout.strip() or r.stderr.strip()}")
-        except subprocess.TimeoutExpired:
-            print(f"  自動重連 {addr}: 逾時")
+    with ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
+        alive = list(pool.map(
+            lambda e: tcp_probe(*e[1]["addr"].rsplit(":", 1)), entries))
+    changed = False
+    reconnected = 0
+    for (serial, rec), ok in zip(entries, alive):
+        addr = rec["addr"]
+        if ok:
+            success = adb_connect(addr, timeout=30)
+            print(f"  自動重連 {addr}: {'成功' if success else '失敗'}")
+            reconnected += 1 if success else 0
+            continue
+        if host_state(addr.rpartition(":")[0]) != "awake":
+            print(f"  {addr} 無回應（睡著／關機／換了 IP），略過")
+            continue
+        # 主機醒著但舊 port 不通 -> port 變了。一次只找一台：掃描本身
+        # 已用滿 64 個 worker，並行會觸發裝置端 SYN backlog 丟包而漏掃
+        new_addr, msg = recover_addr(addr, deadline=QUICK_RECOVER_DEADLINE)
+        print(f"  {addr}: {msg}")
+        if new_addr:
+            rec["addr"] = new_addr
+            changed = True
+            reconnected += 1
+    if changed:
+        save_known(known)
+    if not reconnected:
+        print(f"曾連線的 {len(entries)} 台裝置皆未接回，請確認無線偵錯是否開啟")
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -1012,11 +1152,7 @@ class ADBHandler(BaseHTTPRequestHandler):
         return load_known()
 
     def _save_known(self, known):
-        try:
-            with open(KNOWN_PATH, "w", encoding="utf-8") as f:
-                json.dump(known, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        save_known(known)
 
     def _remember_connected(self):
         """把目前以 IP:port 連線的無線裝置記進 known_devices.json
@@ -1047,7 +1183,7 @@ class ADBHandler(BaseHTTPRequestHandler):
 
     def _validate_addr(self, addr):
         """驗證 IP:Port 或 hostname:Port 格式，防止指令注入"""
-        return bool(re.match(r"^[\w.\-]+:\d{1,5}$", addr))
+        return validate_addr(addr)
 
     def _resolve_targets(self, requested=None):
         """決定這次操作要對哪一批裝置下指令
@@ -1205,43 +1341,9 @@ class ADBHandler(BaseHTTPRequestHandler):
         return state, msg
 
     def _recover_addr(self, addr):
-        """裝置還醒著但 port 變了時，掃描找回新的 adbd port 並重新連線。
-
-        為什麼這樣行得通：Android 的無線偵錯配對是持久的 —— 一旦配對過，
-        裝置就信任這台主機的金鑰。port 改變並不會使配對失效，所以只要找到
-        新 port 直接 connect 就會成功，不需要重新配對，也不用去動裝置上的
-        「無線偵錯」開關。
-
-        回傳 (成功與否, 訊息)。
-        """
-        ip, _, old_port = addr.rpartition(":")
-        last = int(old_port) if old_port.isdigit() else None
-
-        # 先問 mDNS：裝置只要開著無線偵錯就會廣播當前 port，幾秒就有精確
-        # 答案。掃描是最後手段 —— 實測掃 31000 個 port 要 9 分鐘，而 mDNS
-        # 一次就直接給出正確的 port。
-        for dev in self._adb_mdns_services("_adb-tls-connect"):
-            cand = dev.get("addr", "")
-            if cand.startswith(ip + ":") and cand != addr:
-                r = self._run_adb(["connect", cand], timeout=15)
-                if "connected to" in r.get("output", "").lower():
-                    return True, f"mDNS 找到當前位址，已重新連線：{cand}"
-
-        tried = []
-        for ports in scan_bands(last):
-            for cand in scan_ports(ip, ports):
-                if cand == last:
-                    continue  # 已知連不上，別再試
-                r = self._run_adb(["connect", f"{ip}:{cand}"], timeout=15)
-                out = r.get("output", "")
-                if "connected to" in out.lower():
-                    return True, f"找到新的 port，已重新連線：{ip}:{cand}"
-                tried.append(cand)
-        detail = f"（試過 {', '.join(map(str, tried))}）" if tried else ""
-        return False, (
-            f"{ip} 醒著，但掃遍 30000-50000 都沒找到可連線的 adbd port{detail}。\n"
-            "請確認裝置上的「無線偵錯」仍然開啟。"
-        )
+        """使用者明確按「連線」時的完整找回：不限時，掃好掃滿。"""
+        new_addr, msg = recover_addr(addr)
+        return bool(new_addr), msg
 
     def _resolve_host_candidates(self, hostname):
         """取得主機名的所有 A record 候選 IP
@@ -1376,45 +1478,7 @@ class ADBHandler(BaseHTTPRequestHandler):
         return devices
 
     def _adb_mdns_services(self, filter_type=None):
-        """使用 adb mdns services 查詢 ADB 內建的 mDNS 追蹤結果
-
-        這是最可靠的來源：adb 自帶的 openscreen mDNS daemon 會持續追蹤，
-        且直接從同一個回應封包取出 A record，回傳真正的 per-device IP
-        （不像 dns-sd 只給通用主機名 Android.local，多台裝置會撞號）。
-
-        輸出格式（欄位以 tab 分隔，行首即為服務名稱，不是縮排）：
-            List of discovered mdns services
-            adb-XXXX-yyyy\t_adb-tls-pairing._tcp\t192.168.1.59:35825
-        """
-        try:
-            r = subprocess.run(
-                [ADB_PATH, "mdns", "services"],
-                capture_output=True, text=True, timeout=5
-            )
-        except Exception:
-            return []
-
-        devices = []
-        for line in r.stdout.splitlines():
-            parts = line.split()
-            # 格式: name  service_type  addr:port
-            if len(parts) < 3:
-                continue
-            name, svc_type, addr = parts[0], parts[1], parts[2]
-            # 跳過標題列與任何非 ADB 服務的雜訊
-            if "_adb" not in svc_type:
-                continue
-            if filter_type and filter_type not in svc_type:
-                continue
-            if not self._validate_addr(addr):
-                continue
-            devices.append({
-                "name": name,
-                "addr": addr,
-                "hostname": "",
-                "source": "adb-mdns",
-            })
-        return devices
+        return adb_mdns_services(filter_type)
 
     def _discover_mdns(self, service_type):
         """合併兩個 mDNS 來源，以 adb mdns services 為權威
@@ -1543,16 +1607,31 @@ class ADBHandler(BaseHTTPRequestHandler):
                         "addr": addr,
                         "status": "已自動重連" if r["success"] else "重連失敗，請手動連線",
                     })
-                else:
-                    found.append({
-                        "name": f"{label} ({serial})",
-                        "addr": addr,
-                        "status": "曾連線過，可重連" if ok else {
-                            "awake": "裝置醒著但 port 已變 —— 按「連線」可自動找回",
-                            "asleep": "完全無回應（睡著／換了 IP／被 AP 隔離）",
-                            "unreachable": "不在網路上，IP 可能已改變",
-                        }.get(states.get(addr), "目前無回應"),
-                    })
+                    seen_serials.add(serial)
+                    continue
+                if states.get(addr) == "awake" and auto_reconnect:
+                    # port 已變（常見於裝置重開機）。就地快速找回並更新紀錄，
+                    # 查詢結果才不會一直卡在過期的舊 port 上
+                    new_addr, _ = recover_addr(addr, deadline=QUICK_RECOVER_DEADLINE)
+                    if new_addr:
+                        rec["addr"] = new_addr
+                        self._save_known(known)
+                        found.append({
+                            "name": f"{label} ({serial})",
+                            "addr": new_addr,
+                            "status": f"port 已變（原為 {addr}），已自動找回並重連",
+                        })
+                        seen_serials.add(serial)
+                        continue
+                found.append({
+                    "name": f"{label} ({serial})",
+                    "addr": addr,
+                    "status": "曾連線過，可重連" if ok else {
+                        "awake": "裝置醒著但 port 已變 —— 按「連線」做完整掃描找回",
+                        "asleep": "完全無回應（睡著／換了 IP／被 AP 隔離）",
+                        "unreachable": "不在網路上，IP 可能已改變",
+                    }.get(states.get(addr), "目前無回應"),
+                })
                 seen_serials.add(serial)
 
         return found
